@@ -15,7 +15,6 @@ import {
 import type {
   AtlasPage,
   AtlasRegion,
-  NinjaBundleResponse,
   NinjaEntry,
   SlicedFrame,
   SpineSkeleton,
@@ -31,6 +30,7 @@ import {
   renderSpineFrameToCanvas,
   sliceAtlasRegions,
 } from '../utils/atlasParser';
+import { fetchNinjaBundle } from '../utils/remoteClient';
 
 interface StudioStageProps {
   ninja: NinjaEntry | null;
@@ -111,13 +111,7 @@ export function StudioStage({
     async function loadBundle() {
       if (!ninja) return;
       try {
-        const resp = await fetch(
-          `/api/ninja-bundle?atlasUrl=${encodeURIComponent(ninja.atlasUrl)}&skeletonUrl=${encodeURIComponent(ninja.skeletonUrl)}`
-        );
-        const data = (await resp.json()) as NinjaBundleResponse & { error?: string };
-        if (!resp.ok) {
-          throw new Error(data.error || 'Falha ao carregar pacote do ninja.');
-        }
+        const data = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl);
         if (cancelled) return;
 
         const parsedPages = parseAtlas(data.atlasText);

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Download, Scissors, Search } from 'lucide-react';
 import type { GameAssetEntry, SheetEntry } from '../types/sprite';
+import { resolveAssetFetchUrl } from '../utils/remoteClient';
 
 interface GeneralAssetsViewProps {
   sheets: SheetEntry[];
@@ -123,7 +124,7 @@ export function GeneralAssetsView({
         <>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {filteredSheets.slice(0, limit).map((sheet) => {
-              const proxyUrl = `/api/proxy?url=${encodeURIComponent(sheet.url)}`;
+              const proxyUrl = resolveAssetFetchUrl(sheet.url);
               return (
                 <div
                   key={sheet.url}
@@ -187,7 +188,7 @@ export function GeneralAssetsView({
         <>
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
             {filteredAssets.slice(0, limit).map((asset) => {
-              const proxyUrl = `/api/proxy?url=${encodeURIComponent(asset.url)}`;
+              const proxyUrl = resolveAssetFetchUrl(asset.url);
               return (
                 <div
                   key={asset.url}

@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Eye, Image as ImageIcon, Search } from 'lucide-react';
-import type { NinjaBundleResponse, NinjaEntry } from '../types/sprite';
+import { ChevronLeft, ChevronRight, Download, Eye, Image as ImageIcon, Search } from 'lucide-react';
+import type { NinjaEntry } from '../types/sprite';
 import { extractRegionToCanvas, loadImageElement, parseAtlas } from '../utils/atlasParser';
+import { fetchNinjaBundle } from '../utils/remoteClient';
 
 interface NinjaCatalogProps {
   ninjas: NinjaEntry[];
   selectedNinjaId: string | null;
   onSelectNinja: (ninja: NinjaEntry) => void;
   onGoToExtractor: () => void;
+  onOpenBatchZip: (list: NinjaEntry[]) => void;
 }
 
 const PAGE_SIZE = 36;
@@ -54,11 +56,7 @@ async function fetchNinjaThumbnail(ninja: NinjaEntry): Promise<string | null> {
 
   const promise = runWithConcurrency(async () => {
     try {
-      const resp = await fetch(
-        `/api/ninja-bundle?atlasUrl=${encodeURIComponent(ninja.atlasUrl)}&skeletonUrl=${encodeURIComponent(ninja.skeletonUrl)}`
-      );
-      if (!resp.ok) return null;
-      const bundle = (await resp.json()) as NinjaBundleResponse;
+      const bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl);
       const pages = parseAtlas(bundle.atlasText);
       const firstPage = pages[0];
       if (!firstPage || firstPage.regions.length === 0) return null;
@@ -209,6 +207,7 @@ export function NinjaCatalog({
   selectedNinjaId,
   onSelectNinja,
   onGoToExtractor,
+  onOpenBatchZip,
 }: NinjaCatalogProps) {
   const [search, setSearch] = useState('');
   const [sortBy, setSortBy] = useState<'id' | 'largest' | 'smallest'>('id');
@@ -312,6 +311,16 @@ export function NinjaCatalog({
             />
             <span className="whitespace-nowrap">Miniaturas automáticas</span>
           </label>
+
+          <button
+            type="button"
+            disabled={filtered.length === 0}
+            onClick={() => onOpenBatchZip(filtered)}
+            className="inline-flex items-center gap-2 rounded-lg bg-orange-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-orange-500 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
+          >
+            <Download className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Baixar Todos ({filtered.length}) ZIP</span>
+          </button>
         </div>
       </div>
 
