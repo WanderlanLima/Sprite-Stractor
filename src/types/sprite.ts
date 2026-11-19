@@ -138,6 +138,7 @@ export interface NinjaBundleResponse {
   atlasText: string;
   skeleton: SpineSkeleton | null;
   pageUrls: Record<string, string>;
+  idleFrameName?: string;
 }
 
 export interface SlicedFrame {

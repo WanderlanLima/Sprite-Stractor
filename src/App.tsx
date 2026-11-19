@@ -365,16 +365,16 @@ export default function App() {
                         Relay CORS para Modo Estático {isStaticHostingMode() ? '(Ativo)' : '(Opcional)'}
                       </h3>
                       <p className="text-slate-400">
-                        No GitHub Pages não há servidor Node; quando o site de origem bloqueia CORS, o app usa este prefixo de proxy para baixar folhas WebP/.atlas:
+                        No GitHub Pages, as miniaturas, frames fatiados e o download em ZIP de todos os 695 ninjas funcionam automaticamente via pacote estático + CDN <code className="font-mono text-slate-200">wsrv.nl</code> (sem erro 429). Preencha abaixo apenas se quiser usar um Worker/proxy próprio para extrair outras URLs ou animações <code className="font-mono text-slate-200">.json</code>:
                       </p>
                       <div className="flex gap-2">
                         <input
                           type="url"
                           value={corsProxyInput}
                           onChange={(e) => setCorsProxyInput(e.target.value)}
-                          placeholder="https://corsproxy.io/?url="
+                          placeholder="Automático (wsrv.nl + pacote local)"
                           aria-label="URL de Proxy CORS"
-                          className="flex-1 rounded-md border border-slate-800 bg-[#131A26] px-3 py-1.5 font-mono text-xs text-slate-100 focus:border-orange-500 focus:outline-none"
+                          className="flex-1 rounded-md border border-slate-800 bg-[#131A26] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
                         />
                         <button
                           type="button"

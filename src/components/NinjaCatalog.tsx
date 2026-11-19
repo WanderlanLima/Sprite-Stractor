@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Download, Eye, Image as ImageIcon, Search } from 'lucide-react';
 import type { NinjaEntry } from '../types/sprite';
 import { extractRegionToCanvas, loadImageElement, parseAtlas } from '../utils/atlasParser';
-import { fetchNinjaBundle, getNinjaThumbUrl } from '../utils/remoteClient';
+import {
+  fetchNinjaBundle,
+  getNinjaThumbUrl,
+  resolveStaticNinjaThumbUrl,
+} from '../utils/remoteClient';
 
 interface NinjaCatalogProps {
   ninjas: NinjaEntry[];
@@ -144,11 +148,20 @@ function NinjaCard({
         if (entries.some((e) => e.isIntersecting)) {
           observer.disconnect();
           setLoadingThumb(true);
-          void fetchNinjaThumbnail(ninja).then((url) => {
-            if (!cancelled) {
-              setThumbUrl(url);
+          void resolveStaticNinjaThumbUrl(ninja).then((staticUrl) => {
+            if (cancelled) return;
+            if (staticUrl) {
+              thumbnailCache.set(ninja.id, staticUrl);
+              setThumbUrl(staticUrl);
               setLoadingThumb(false);
+              return;
             }
+            void fetchNinjaThumbnail(ninja).then((url) => {
+              if (!cancelled) {
+                setThumbUrl(url);
+                setLoadingThumb(false);
+              }
+            });
           });
         }
       },

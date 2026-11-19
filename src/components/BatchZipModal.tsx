@@ -77,7 +77,9 @@ export function BatchZipModal({
           setProgress({ done, total: targetList.length, currentId: ninja.id, errors });
 
           try {
-            const bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl);
+            const bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl, {
+              skipSkeleton: contentMode !== 'raw-bundle',
+            });
             const pages = parseAtlas(bundle.atlasText);
 
             if (contentMode === 'raw-bundle') {
@@ -104,14 +106,16 @@ export function BatchZipModal({
               if (contentMode === 'idle-only') {
                 const allRegions = pages.flatMap((p) => p.regions);
                 if (allRegions.length > 0) {
-                  let targetRegionName = allRegions[0].name;
-                  const idleSlots = bundle.skeleton?.animations?.idle?.slots;
-                  if (idleSlots) {
-                    const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
-                    const firstAtt = preferredSlot?.attachment?.find(
-                      (a) => typeof a.name === 'string'
-                    );
-                    if (firstAtt?.name) targetRegionName = firstAtt.name;
+                  let targetRegionName = bundle.idleFrameName || allRegions[0].name;
+                  if (!bundle.idleFrameName) {
+                    const idleSlots = bundle.skeleton?.animations?.idle?.slots;
+                    if (idleSlots) {
+                      const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
+                      const firstAtt = preferredSlot?.attachment?.find(
+                        (a) => typeof a.name === 'string'
+                      );
+                      if (firstAtt?.name) targetRegionName = firstAtt.name;
+                    }
                   }
                   const region =
                     allRegions.find((r) => r.name === targetRegionName) || allRegions[0];

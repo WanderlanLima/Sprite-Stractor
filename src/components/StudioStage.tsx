@@ -430,6 +430,12 @@ export function StudioStage({
         </div>
       )}
 
+      {!loading && !error && frames.length > 0 && !skeleton && (
+        <div className="rounded-lg border border-amber-800/60 bg-amber-950/25 px-4 py-3 text-xs text-amber-200">
+          Modo estático: os frames fatiados e a folha original foram carregados normalmente para visualização e exportação em PNG/ZIP. Para reproduzir animações Spine (.json) no GitHub Pages, configure um Proxy CORS próprio (ex: Cloudflare Worker) nas opções da aba Extrator URL.
+        </div>
+      )}
+
       {!loading && !error && (
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_300px]">
           {/* Main Stage */}
