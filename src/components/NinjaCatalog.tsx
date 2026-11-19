@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Download, Eye, Image as ImageIcon, Search } from 'lucide-react';
 import type { NinjaEntry } from '../types/sprite';
 import { extractRegionToCanvas, loadImageElement, parseAtlas } from '../utils/atlasParser';
-import { fetchNinjaBundle } from '../utils/remoteClient';
+import { fetchNinjaBundle, getNinjaThumbUrl } from '../utils/remoteClient';
 
 interface NinjaCatalogProps {
   ninjas: NinjaEntry[];
@@ -58,29 +58,28 @@ async function fetchNinjaThumbnail(ninja: NinjaEntry): Promise<string | null> {
     try {
       const bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl);
       const pages = parseAtlas(bundle.atlasText);
-      const firstPage = pages[0];
-      if (!firstPage || firstPage.regions.length === 0) return null;
+      const allRegions = pages.flatMap((p) => p.regions);
+      if (allRegions.length === 0) return null;
 
-      // Prefer idle attachment frame if skeleton is available
-      let targetRegionName = firstPage.regions[0].name;
+      // Prefer L0 idle attachment frame if skeleton is available
+      let targetRegionName = allRegions[0].name;
       const idleSlotAnim = bundle.skeleton?.animations?.idle?.slots;
       if (idleSlotAnim) {
-        const firstSlot = Object.values(idleSlotAnim)[0];
-        const firstAttach = firstSlot?.attachment?.find((a) => typeof a.name === 'string');
+        const preferredSlot = idleSlotAnim.L0 || Object.values(idleSlotAnim)[0];
+        const firstAttach = preferredSlot?.attachment?.find((a) => typeof a.name === 'string');
         if (firstAttach?.name) targetRegionName = firstAttach.name;
       }
 
       const targetRegion =
-        firstPage.regions.find((r) => r.name === targetRegionName) || firstPage.regions[0];
+        allRegions.find((r) => r.name === targetRegionName) || allRegions[0];
       const pageProxyUrl = bundle.pageUrls[targetRegion.pageName] || Object.values(bundle.pageUrls)[0];
       if (!pageProxyUrl) return null;
 
       const img = await loadImageElement(pageProxyUrl);
       const cropped = extractRegionToCanvas(targetRegion, img);
 
-      // Downscale slightly into crisp thumbnail data URL
       const thumbCanvas = document.createElement('canvas');
-      const maxDim = 128;
+      const maxDim = 144;
       const scale = Math.min(1, maxDim / Math.max(cropped.width, cropped.height));
       thumbCanvas.width = Math.max(1, Math.round(cropped.width * scale));
       thumbCanvas.height = Math.max(1, Math.round(cropped.height * scale));
@@ -113,7 +112,12 @@ function NinjaCard({
   onSelect: () => void;
 }) {
   const cardRef = useRef<HTMLButtonElement | null>(null);
-  const [thumbUrl, setThumbUrl] = useState<string | null>(() => thumbnailCache.get(ninja.id) || null);
+  const directThumbUrl = autoThumbnails
+    ? getNinjaThumbUrl(ninja.atlasUrl, ninja.skeletonUrl)
+    : null;
+  const [thumbUrl, setThumbUrl] = useState<string | null>(
+    () => thumbnailCache.get(ninja.id) || directThumbUrl
+  );
   const [loadingThumb, setLoadingThumb] = useState(false);
 
   useEffect(() => {
@@ -122,7 +126,14 @@ function NinjaCard({
       setThumbUrl(cached);
       return;
     }
-    if (!autoThumbnails) return;
+    if (!autoThumbnails) {
+      setThumbUrl(null);
+      return;
+    }
+    if (directThumbUrl) {
+      setThumbUrl(directThumbUrl);
+      return;
+    }
 
     const el = cardRef.current;
     if (!el) return;
@@ -149,7 +160,7 @@ function NinjaCard({
       cancelled = true;
       observer.disconnect();
     };
-  }, [ninja, autoThumbnails]);
+  }, [ninja, autoThumbnails, directThumbUrl]);
 
   return (
     <button
@@ -167,7 +178,9 @@ function NinjaCard({
           <img
             src={thumbUrl}
             alt={`Sprite ${ninja.id}`}
+            loading="lazy"
             referrerPolicy="no-referrer"
+            onError={() => setThumbUrl(null)}
             className="max-h-full max-w-full object-contain transition-transform duration-200 group-hover:scale-105"
           />
         ) : (

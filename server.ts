@@ -1,4 +1,5 @@
 import express from 'express';
+import { spawn } from 'node:child_process';
 import dns from 'node:dns/promises';
 import http from 'node:http';
 import net from 'node:net';
@@ -261,9 +262,156 @@ function parseAtlasPageFilenames(atlasText: string): string[] {
   return pages;
 }
 
+function parseAtlasRegionsServer(atlasText: string): Array<{
+  name: string;
+  pageName: string;
+  rotate: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}> {
+  const lines = atlasText.split(/\r?\n/);
+  const regions: Array<{
+    name: string;
+    pageName: string;
+    rotate: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }> = [];
+  let currentPage: string | null = null;
+  let currentRegion: {
+    name: string;
+    pageName: string;
+    rotate: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null = null;
+
+  const parsePair = (val: string): [number, number] => {
+    const parts = val.split(',').map((s) => Number(s.trim()));
+    return [parts[0] || 0, parts[1] || 0];
+  };
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      if (currentRegion) {
+        regions.push(currentRegion);
+        currentRegion = null;
+      }
+      currentPage = null;
+      continue;
+    }
+    const isIndented = /^\s+/.test(rawLine);
+    const colonIdx = trimmed.indexOf(':');
+    if (!currentPage) {
+      currentPage = trimmed;
+      continue;
+    }
+    if (!isIndented && colonIdx === -1) {
+      if (/\.(png|webp|jpe?g|gif|ktx2?)$/i.test(trimmed)) {
+        if (currentRegion) {
+          regions.push(currentRegion);
+          currentRegion = null;
+        }
+        currentPage = trimmed;
+      } else {
+        if (currentRegion) regions.push(currentRegion);
+        currentRegion = {
+          name: trimmed,
+          pageName: currentPage,
+          rotate: 0,
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 0,
+        };
+      }
+      continue;
+    }
+    if (currentRegion && colonIdx !== -1) {
+      const key = trimmed.slice(0, colonIdx).trim();
+      const val = trimmed.slice(colonIdx + 1).trim();
+      if (key === 'rotate') {
+        currentRegion.rotate = val === 'true' ? 90 : val === 'false' ? 0 : Number(val) || 0;
+      } else if (key === 'xy') {
+        const [x, y] = parsePair(val);
+        currentRegion.x = x;
+        currentRegion.y = y;
+      } else if (key === 'size') {
+        const [w, h] = parsePair(val);
+        currentRegion.width = w;
+        currentRegion.height = h;
+      }
+    }
+  }
+  if (currentRegion) regions.push(currentRegion);
+  return regions;
+}
+
+function cropImageBufferWithConvert(
+  inputBuffer: Buffer,
+  ext: string,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  rotateDeg: number
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const inputFmt = ext === 'png' ? 'png:-' : ext === 'jpg' || ext === 'jpeg' ? 'jpg:-' : 'webp:-';
+    const args = [
+      inputFmt,
+      '-crop',
+      `${Math.max(1, w)}x${Math.max(1, h)}+${Math.max(0, x)}+${Math.max(0, y)}`,
+      '+repage',
+    ];
+    if (rotateDeg === 90) {
+      args.push('-rotate', '-90');
+    }
+    args.push('-resize', '144x144>', 'png:-');
+
+    const proc = spawn('convert', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+
+    proc.stdout.on('data', (d: Buffer) => chunks.push(d));
+    proc.stderr.on('data', (d: Buffer) => errChunks.push(d));
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0 && chunks.length > 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        reject(new Error(Buffer.concat(errChunks).toString('utf8') || `convert exited ${code}`));
+      }
+    });
+
+    proc.stdin.write(inputBuffer);
+    proc.stdin.end();
+  });
+}
+
+const thumbMemoryCache = new Map<string, Buffer>();
+
 async function createServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
+
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
 
   app.post('/api/extract', async (req, res) => {
     const startedAt = Date.now();
@@ -598,6 +746,106 @@ async function createServer() {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Erro no proxy de ativos.';
       res.status(400).json({ error: message });
+    }
+  });
+
+  app.get('/api/ninja-thumb', async (req, res) => {
+    try {
+      const atlasUrl = typeof req.query.atlasUrl === 'string' ? req.query.atlasUrl : '';
+      const skeletonUrl = typeof req.query.skeletonUrl === 'string' ? req.query.skeletonUrl : '';
+      if (!atlasUrl) {
+        res.status(400).json({ error: 'Parâmetro atlasUrl obrigatório.' });
+        return;
+      }
+
+      const cached = thumbMemoryCache.get(atlasUrl);
+      if (cached) {
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.send(cached);
+        return;
+      }
+
+      const validAtlasUrl = await validatePublicUrl(atlasUrl);
+      const validSkeletonUrl = skeletonUrl ? await validatePublicUrl(skeletonUrl) : null;
+
+      const [atlasResp, skelResp] = await Promise.all([
+        fetchWithTimeout(validAtlasUrl.toString(), 10000, 'text/plain,*/*'),
+        validSkeletonUrl
+          ? fetchWithTimeout(validSkeletonUrl.toString(), 10000, 'application/json,*/*').catch(() => null)
+          : Promise.resolve(null),
+      ]);
+
+      if (!atlasResp.ok) {
+        res.status(404).end();
+        return;
+      }
+      const atlasText = await atlasResp.text();
+      const regions = parseAtlasRegionsServer(atlasText);
+      if (regions.length === 0) {
+        res.status(404).end();
+        return;
+      }
+
+      let targetName = regions[0].name;
+      if (skelResp && skelResp.ok) {
+        try {
+          const skel = (await skelResp.json()) as {
+            animations?: {
+              idle?: {
+                slots?: Record<string, { attachment?: Array<{ name?: string | null }> }>;
+              };
+            };
+          };
+          const idleSlots = skel?.animations?.idle?.slots;
+          if (idleSlots) {
+            const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
+            const firstAtt = preferredSlot?.attachment?.find((a) => typeof a.name === 'string');
+            if (firstAtt?.name) targetName = firstAtt.name;
+          }
+        } catch {
+          // fallback to first region
+        }
+      }
+
+      const region = regions.find((r) => r.name === targetName) || regions[0];
+      const pageUrl = resolveRelativeUrl(validAtlasUrl.toString(), region.pageName);
+      if (!pageUrl) {
+        res.status(404).end();
+        return;
+      }
+      await validatePublicUrl(pageUrl);
+      const imgResp = await fetchWithTimeout(pageUrl, 15000, 'image/*,*/*');
+      if (!imgResp.ok) {
+        res.status(502).end();
+        return;
+      }
+
+      const buf = Buffer.from(await imgResp.arrayBuffer());
+      const ext = region.pageName.split('.').pop()?.toLowerCase() || 'webp';
+      const cropW = region.rotate === 90 ? region.height : region.width;
+      const cropH = region.rotate === 90 ? region.width : region.height;
+      const pngBuf = await cropImageBufferWithConvert(
+        buf,
+        ext,
+        region.x,
+        region.y,
+        cropW,
+        cropH,
+        region.rotate
+      );
+
+      if (thumbMemoryCache.size > 400) {
+        const oldestKey = thumbMemoryCache.keys().next().value;
+        if (oldestKey) thumbMemoryCache.delete(oldestKey);
+      }
+      thumbMemoryCache.set(atlasUrl, pngBuf);
+
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.send(pngBuf);
+    } catch {
+      res.status(500).end();
     }
   });
 

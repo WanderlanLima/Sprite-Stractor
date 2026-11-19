@@ -243,7 +243,7 @@ export function StudioStage({
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [stageMode, skeleton, selectedAnim, regionCanvasMap, isPlaying, speed, duration, zoom]);
+  }, [stageMode, skeleton, selectedAnim, regionCanvasMap, isPlaying, speed, duration, zoom, loading]);
 
   // Redraw when manually scrubbing while paused
   useEffect(() => {

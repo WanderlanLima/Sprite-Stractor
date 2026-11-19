@@ -41,6 +41,13 @@ export function resolveAssetFetchUrl(targetUrl: string): string {
   return `/api/proxy?url=${encodeURIComponent(targetUrl)}`;
 }
 
+export function getNinjaThumbUrl(atlasUrl: string, skeletonUrl: string): string | null {
+  if (backendStatus === 'static') {
+    return null;
+  }
+  return `/api/ninja-thumb?atlasUrl=${encodeURIComponent(atlasUrl)}&skeletonUrl=${encodeURIComponent(skeletonUrl)}`;
+}
+
 function parseAtlasPageFilenames(atlasText: string): string[] {
   const lines = atlasText.split(/\r?\n/);
   const pages: string[] = [];

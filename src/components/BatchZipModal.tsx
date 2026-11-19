@@ -102,20 +102,19 @@ export function BatchZipModal({
               }
 
               if (contentMode === 'idle-only') {
-                const firstPage = pages[0];
-                if (firstPage && firstPage.regions.length > 0) {
-                  let targetRegionName = firstPage.regions[0].name;
+                const allRegions = pages.flatMap((p) => p.regions);
+                if (allRegions.length > 0) {
+                  let targetRegionName = allRegions[0].name;
                   const idleSlots = bundle.skeleton?.animations?.idle?.slots;
                   if (idleSlots) {
-                    const firstSlot = Object.values(idleSlots)[0];
-                    const firstAtt = firstSlot?.attachment?.find(
+                    const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
+                    const firstAtt = preferredSlot?.attachment?.find(
                       (a) => typeof a.name === 'string'
                     );
                     if (firstAtt?.name) targetRegionName = firstAtt.name;
                   }
                   const region =
-                    firstPage.regions.find((r) => r.name === targetRegionName) ||
-                    firstPage.regions[0];
+                    allRegions.find((r) => r.name === targetRegionName) || allRegions[0];
                   const img = pageImages[region.pageName];
                   if (img) {
                     const canvas = extractRegionToCanvas(region, img);
