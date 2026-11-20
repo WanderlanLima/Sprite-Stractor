@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   ChevronLeft,
   Download,
   Film,
   Grid,
   Layers,
+  Maximize2,
   Pause,
   Play,
   SkipBack,
@@ -20,6 +25,7 @@ import type {
   SpineSkeleton,
 } from '../types/sprite';
 import {
+  computeAnimationWorldBounds,
   downloadDataUrl,
   exportAnimationStripPng,
   exportFramesAsZip,
@@ -66,7 +72,10 @@ export function StudioStage({
 }: StudioStageProps) {
   const [stageMode, setStageMode] = useState<StageMode>('player');
   const [bgStyle, setBgStyle] = useState<BgStyle>('checker');
-  const [zoom, setZoom] = useState(1.25);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [autoFit, setAutoFit] = useState(true);
+  const dragStartRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -106,6 +115,8 @@ export function StudioStage({
     setError(null);
     setSelectedRegion(null);
     setCurrentTime(0);
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
     animTimeRef.current = 0;
 
     async function loadBundle() {
@@ -198,6 +209,19 @@ export function StudioStage({
     return getAnimationDuration(skeleton, selectedAnim);
   }, [skeleton, selectedAnim]);
 
+  const animWorldBounds = useMemo(() => {
+    if (!skeleton || !selectedAnim || regionCanvasMap.size === 0) return null;
+    return computeAnimationWorldBounds(skeleton, selectedAnim, regionCanvasMap, 24);
+  }, [skeleton, selectedAnim, regionCanvasMap]);
+
+  // Reset framing cleanly when switching animations if autoFit is active
+  useEffect(() => {
+    if (autoFit) {
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+    }
+  }, [selectedAnim, autoFit]);
+
   // Animation loop
   useEffect(() => {
     if (stageMode !== 'player' || !skeleton || !selectedAnim || regionCanvasMap.size === 0) {
@@ -220,7 +244,10 @@ export function StudioStage({
         selectedAnim,
         t,
         regionCanvasMap,
-        zoom
+        zoom,
+        pan.x,
+        pan.y,
+        autoFit ? animWorldBounds : null
       );
     };
 
@@ -243,7 +270,20 @@ export function StudioStage({
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [stageMode, skeleton, selectedAnim, regionCanvasMap, isPlaying, speed, duration, zoom, loading]);
+  }, [
+    stageMode,
+    skeleton,
+    selectedAnim,
+    regionCanvasMap,
+    isPlaying,
+    speed,
+    duration,
+    zoom,
+    pan,
+    autoFit,
+    animWorldBounds,
+    loading,
+  ]);
 
   // Redraw when manually scrubbing while paused
   useEffect(() => {
@@ -260,10 +300,24 @@ export function StudioStage({
         selectedAnim,
         currentTime,
         regionCanvasMap,
-        zoom
+        zoom,
+        pan.x,
+        pan.y,
+        autoFit ? animWorldBounds : null
       );
     }
-  }, [currentTime, isPlaying, stageMode, skeleton, selectedAnim, regionCanvasMap, zoom]);
+  }, [
+    currentTime,
+    isPlaying,
+    stageMode,
+    skeleton,
+    selectedAnim,
+    regionCanvasMap,
+    zoom,
+    pan,
+    autoFit,
+    animWorldBounds,
+  ]);
 
   const bgClass =
     bgStyle === 'checker'
@@ -295,8 +349,11 @@ export function StudioStage({
     try {
       const fps = 18;
       const count = Math.max(1, Math.min(72, Math.round(duration * fps)));
-      const cellW = Math.max(160, Math.ceil((skeleton.skeleton?.width || 140) * 1.8));
-      const cellH = Math.max(160, Math.ceil((skeleton.skeleton?.height || 140) * 1.8));
+      const bounds =
+        animWorldBounds ||
+        computeAnimationWorldBounds(skeleton, selectedAnim, regionCanvasMap, 24);
+      const cellW = Math.max(160, Math.min(640, Math.ceil(bounds.width * 1.16)));
+      const cellH = Math.max(160, Math.min(640, Math.ceil(bounds.height * 1.16)));
       const offCanvas = document.createElement('canvas');
       offCanvas.width = cellW;
       offCanvas.height = cellH;
@@ -306,7 +363,19 @@ export function StudioStage({
       if (ctx) {
         for (let i = 0; i < count; i++) {
           const t = count === 1 ? 0 : (i / count) * duration;
-          renderSpineFrameToCanvas(ctx, cellW, cellH, skeleton, selectedAnim, t, regionCanvasMap, 1);
+          renderSpineFrameToCanvas(
+            ctx,
+            cellW,
+            cellH,
+            skeleton,
+            selectedAnim,
+            t,
+            regionCanvasMap,
+            1,
+            0,
+            0,
+            bounds
+          );
           animFrames.push({
             id: `${selectedAnim}_${i}`,
             name: `${selectedAnim}_${String(i).padStart(3, '0')}`,
@@ -468,37 +537,128 @@ export function StudioStage({
                     ))}
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setPan((p) => ({ ...p, x: p.x - 24 }))}
+                        aria-label="Mover para esquerda"
+                        title="Mover esquerda"
+                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                      >
+                        <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPan((p) => ({ ...p, y: p.y - 24 }))}
+                        aria-label="Mover para cima"
+                        title="Mover cima"
+                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                      >
+                        <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPan((p) => ({ ...p, y: p.y + 24 }))}
+                        aria-label="Mover para baixo"
+                        title="Mover baixo"
+                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                      >
+                        <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPan((p) => ({ ...p, x: p.x + 24 }))}
+                        aria-label="Mover para direita"
+                        title="Mover direita"
+                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                      >
+                        <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                    </div>
+
                     <button
                       type="button"
-                      onClick={() => setZoom((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))))}
-                      aria-label="Diminuir zoom"
-                      className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
+                      onClick={() => {
+                        setAutoFit(true);
+                        setZoom(1);
+                        setPan({ x: 0, y: 0 });
+                      }}
+                      title="Enquadrar animação inteira na tela"
+                      className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-xs font-medium cursor-pointer transition-colors ${
+                        autoFit && zoom === 1 && pan.x === 0 && pan.y === 0
+                          ? 'border-orange-500/60 bg-orange-950/30 text-orange-200'
+                          : 'border-slate-800 bg-[#0B0F17] text-slate-300 hover:border-slate-600'
+                      }`}
                     >
-                      <ZoomOut className="h-3.5 w-3.5" aria-hidden="true" />
+                      <Maximize2 className="h-3 w-3" aria-hidden="true" />
+                      <span>Enquadrar</span>
                     </button>
-                    <span className="w-12 text-center font-mono text-xs text-slate-300 tabular-nums">
-                      {Math.round(zoom * 100)}%
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setZoom((z) => Math.min(3, Number((z + 0.25).toFixed(2))))}
-                      aria-label="Aumentar zoom"
-                      className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
-                    >
-                      <ZoomIn className="h-3.5 w-3.5" aria-hidden="true" />
-                    </button>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setZoom((z) => Math.max(0.2, Number((z - 0.15).toFixed(2))))}
+                        aria-label="Diminuir zoom"
+                        className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
+                      >
+                        <ZoomOut className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                      <span className="w-11 text-center font-mono text-xs text-slate-300 tabular-nums">
+                        {Math.round(zoom * 100)}%
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setZoom((z) => Math.min(3, Number((z + 0.15).toFixed(2))))}
+                        aria-label="Aumentar zoom"
+                        className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
+                      >
+                        <ZoomIn className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                    </div>
                   </div>
                 </div>
 
-                {/* Stage Canvas */}
-                <div className={`${bgClass} flex items-center justify-center p-4`}>
+                {/* Stage Canvas (supports touch/mouse drag to pan) */}
+                <div className={`${bgClass} relative flex items-center justify-center p-4`}>
                   <canvas
                     ref={playerCanvasRef}
                     width={640}
                     height={420}
-                    className="max-h-[420px] w-full max-w-[640px] object-contain"
+                    onPointerDown={(e) => {
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      dragStartRef.current = {
+                        x: e.clientX,
+                        y: e.clientY,
+                        panX: pan.x,
+                        panY: pan.y,
+                      };
+                    }}
+                    onPointerMove={(e) => {
+                      const d = dragStartRef.current;
+                      if (!d) return;
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const scaleX = e.currentTarget.width / Math.max(1, rect.width);
+                      const scaleY = e.currentTarget.height / Math.max(1, rect.height);
+                      setPan({
+                        x: Math.round(d.panX + (e.clientX - d.x) * scaleX),
+                        y: Math.round(d.panY + (e.clientY - d.y) * scaleY),
+                      });
+                    }}
+                    onPointerUp={(e) => {
+                      dragStartRef.current = null;
+                      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      }
+                    }}
+                    onPointerCancel={() => {
+                      dragStartRef.current = null;
+                    }}
+                    className="max-h-[420px] w-full max-w-[640px] object-contain touch-none cursor-grab active:cursor-grabbing"
                   />
+                  <span className="pointer-events-none absolute bottom-2 right-3 rounded bg-black/55 px-2 py-0.5 text-[10px] font-mono text-slate-300">
+                    Arraste para mover · Enquadramento automático ativo
+                  </span>
                 </div>
 
                 {/* Playback & Export Controls */}

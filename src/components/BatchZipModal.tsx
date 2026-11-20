@@ -1,15 +1,14 @@
 import { useRef, useState } from 'react';
-import JSZip from 'jszip';
 import { Download, X } from 'lucide-react';
 import type { NinjaEntry } from '../types/sprite';
 import {
   downloadBlob,
-  extractRegionToCanvas,
+  extractRegionToPngBlob,
   loadImageElement,
   parseAtlas,
-  sliceAtlasRegions,
 } from '../utils/atlasParser';
 import { fetchNinjaBundle } from '../utils/remoteClient';
+import { createZipWorkerSession, type ZipWorkerSession } from '../utils/zipWorkerClient';
 
 interface BatchZipModalProps {
   isOpen: boolean;
@@ -30,9 +29,17 @@ export function BatchZipModal({
   const [startIdx, setStartIdx] = useState(1);
   const [endIdx, setEndIdx] = useState(() => ninjas.length);
   const [chunkSize, setChunkSize] = useState<number>(100);
+  const [concurrency, setConcurrency] = useState<number>(8);
 
   const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState({ done: 0, total: 0, currentId: '', errors: 0 });
+  const [progress, setProgress] = useState({
+    done: 0,
+    total: 0,
+    currentId: '',
+    errors: 0,
+    ratePerSec: 0,
+    zipPercent: null as number | null,
+  });
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -57,10 +64,125 @@ export function BatchZipModal({
     const effectiveChunk =
       chunkSize <= 0 ? targetList.length : Math.max(10, chunkSize);
     const totalParts = Math.ceil(targetList.length / effectiveChunk);
+    const workers = Math.max(1, Math.min(16, concurrency));
 
+    const startedAt = performance.now();
     let done = 0;
     let errors = 0;
-    setProgress({ done: 0, total: targetList.length, currentId: targetList[0].id, errors: 0 });
+    setProgress({
+      done: 0,
+      total: targetList.length,
+      currentId: targetList[0].id,
+      errors: 0,
+      ratePerSec: 0,
+      zipPercent: null,
+    });
+
+    const processOneNinja = async (ninja: NinjaEntry, session: ZipWorkerSession) => {
+      if (controller.signal.aborted) return;
+      try {
+        const bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl, {
+          skipSkeleton: contentMode === 'idle-only',
+        });
+        if (controller.signal.aborted) return;
+
+        const pages = parseAtlas(bundle.atlasText);
+        const batch: Array<{ path: string; data: Blob | ArrayBuffer | string }> = [];
+
+        if (contentMode === 'raw-bundle') {
+          batch.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
+          if (bundle.skeleton) {
+            batch.push({
+              path: `${ninja.id}/${ninja.id}.json`,
+              data: JSON.stringify(bundle.skeleton),
+            });
+          }
+          await Promise.all(
+            Object.entries(bundle.pageUrls).map(async ([pageName, proxyUrl]) => {
+              const resp = await fetch(proxyUrl, { signal: controller.signal });
+              if (resp.ok) {
+                const buf = await resp.arrayBuffer();
+                batch.push({ path: `${ninja.id}/${pageName}`, data: buf });
+              }
+            })
+          );
+        } else {
+          const pageImages: Record<string, HTMLImageElement> = {};
+          await Promise.all(
+            Object.entries(bundle.pageUrls).map(async ([pageName, proxyUrl]) => {
+              pageImages[pageName] = await loadImageElement(proxyUrl);
+            })
+          );
+          if (controller.signal.aborted) return;
+
+          if (contentMode === 'idle-only') {
+            const allRegions = pages.flatMap((p) => p.regions);
+            if (allRegions.length > 0) {
+              let targetRegionName = bundle.idleFrameName || allRegions[0].name;
+              if (!bundle.idleFrameName) {
+                const idleSlots = bundle.skeleton?.animations?.idle?.slots;
+                if (idleSlots) {
+                  const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
+                  const firstAtt = preferredSlot?.attachment?.find(
+                    (a) => typeof a.name === 'string'
+                  );
+                  if (firstAtt?.name) targetRegionName = firstAtt.name;
+                }
+              }
+              const region =
+                allRegions.find((r) => r.name === targetRegionName) || allRegions[0];
+              const img = pageImages[region.pageName];
+              if (img) {
+                const blob = await extractRegionToPngBlob(region, img);
+                if (blob) {
+                  batch.push({ path: `${ninja.id}.png`, data: blob });
+                }
+              }
+            }
+          } else {
+            for (const page of pages) {
+              const img = pageImages[page.name];
+              if (!img) continue;
+              const blobs = await Promise.all(
+                page.regions.map(async (region) => {
+                  const frameName =
+                    region.index >= 0 ? `${region.name}_${region.index}` : region.name;
+                  const blob = await extractRegionToPngBlob(region, img);
+                  return blob ? { path: `${ninja.id}/${frameName}.png`, data: blob } : null;
+                })
+              );
+              for (const item of blobs) {
+                if (item) batch.push(item);
+              }
+            }
+            batch.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
+            if (bundle.skeleton) {
+              batch.push({
+                path: `${ninja.id}/${ninja.id}.json`,
+                data: JSON.stringify(bundle.skeleton),
+              });
+            }
+          }
+        }
+
+        if (batch.length > 0 && !controller.signal.aborted) {
+          await session.addFilesBatch(batch);
+        }
+      } catch {
+        errors++;
+      } finally {
+        done++;
+        const elapsedSec = Math.max(0.2, (performance.now() - startedAt) / 1000);
+        setProgress({
+          done,
+          total: targetList.length,
+          currentId: ninja.id,
+          errors,
+          ratePerSec: Number((done / elapsedSec).toFixed(1)),
+          zipPercent: null,
+        });
+      }
+    };
 
     try {
       for (let partIndex = 0; partIndex < totalParts; partIndex++) {
@@ -70,99 +192,38 @@ export function BatchZipModal({
           partIndex * effectiveChunk,
           (partIndex + 1) * effectiveChunk
         );
-        const zip = new JSZip();
+        const session = createZipWorkerSession();
 
-        for (const ninja of slice) {
-          if (controller.signal.aborted) break;
-          setProgress({ done, total: targetList.length, currentId: ninja.id, errors });
-
-          try {
-            const bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl, {
-              skipSkeleton: contentMode !== 'raw-bundle',
-            });
-            const pages = parseAtlas(bundle.atlasText);
-
-            if (contentMode === 'raw-bundle') {
-              const folder = zip.folder(ninja.id);
-              if (folder) {
-                folder.file(`${ninja.id}.atlas`, bundle.atlasText);
-                if (bundle.skeleton) {
-                  folder.file(`${ninja.id}.json`, JSON.stringify(bundle.skeleton));
-                }
-                for (const [pageName, proxyUrl] of Object.entries(bundle.pageUrls)) {
-                  const resp = await fetch(proxyUrl, { signal: controller.signal });
-                  if (resp.ok) {
-                    const buf = await resp.arrayBuffer();
-                    folder.file(pageName, buf);
-                  }
-                }
-              }
-            } else {
-              const pageImages: Record<string, HTMLImageElement> = {};
-              for (const [pageName, proxyUrl] of Object.entries(bundle.pageUrls)) {
-                pageImages[pageName] = await loadImageElement(proxyUrl);
-              }
-
-              if (contentMode === 'idle-only') {
-                const allRegions = pages.flatMap((p) => p.regions);
-                if (allRegions.length > 0) {
-                  let targetRegionName = bundle.idleFrameName || allRegions[0].name;
-                  if (!bundle.idleFrameName) {
-                    const idleSlots = bundle.skeleton?.animations?.idle?.slots;
-                    if (idleSlots) {
-                      const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
-                      const firstAtt = preferredSlot?.attachment?.find(
-                        (a) => typeof a.name === 'string'
-                      );
-                      if (firstAtt?.name) targetRegionName = firstAtt.name;
-                    }
-                  }
-                  const region =
-                    allRegions.find((r) => r.name === targetRegionName) || allRegions[0];
-                  const img = pageImages[region.pageName];
-                  if (img) {
-                    const canvas = extractRegionToCanvas(region, img);
-                    const base64 = canvas.toDataURL('image/png').split(',')[1];
-                    if (base64) {
-                      zip.file(`${ninja.id}.png`, base64, { base64: true });
-                    }
-                  }
-                }
-              } else {
-                const sliced = sliceAtlasRegions(pages, pageImages);
-                const folder = zip.folder(ninja.id);
-                if (folder) {
-                  for (const frame of sliced) {
-                    const base64 = frame.dataUrl.split(',')[1];
-                    if (base64) {
-                      folder.file(`${frame.name}.png`, base64, { base64: true });
-                    }
-                  }
-                  folder.file(`${ninja.id}.atlas`, bundle.atlasText);
-                  if (bundle.skeleton) {
-                    folder.file(`${ninja.id}.json`, JSON.stringify(bundle.skeleton));
-                  }
-                }
-              }
+        try {
+          let cursor = 0;
+          const runWorker = async () => {
+            while (!controller.signal.aborted) {
+              const idx = cursor++;
+              if (idx >= slice.length) break;
+              await processOneNinja(slice[idx], session);
             }
-          } catch {
-            errors++;
-          }
+          };
 
-          done++;
-          setProgress({ done, total: targetList.length, currentId: ninja.id, errors });
+          await Promise.all(
+            Array.from({ length: Math.min(workers, slice.length) }, () => runWorker())
+          );
+
+          if (controller.signal.aborted) break;
+
+          setStatusMessage(
+            totalParts > 1
+              ? `Compactando em segundo plano (parte ${partIndex + 1} de ${totalParts})...`
+              : 'Compactando ZIP em segundo plano...'
+          );
+
+          const blob = await session.generateBlob((zipPct) => {
+            setProgress((prev) => ({ ...prev, zipPercent: zipPct }));
+          }, 'STORE');
+          const suffix = totalParts > 1 ? `_parte_${partIndex + 1}_de_${totalParts}` : '';
+          downloadBlob(blob, `shinobi_sprites_${contentMode}${suffix}.zip`);
+        } finally {
+          session.dispose();
         }
-
-        if (controller.signal.aborted) break;
-
-        setStatusMessage(
-          totalParts > 1
-            ? `Compactando parte ${partIndex + 1} de ${totalParts}...`
-            : 'Compactando arquivo ZIP...'
-        );
-        const blob = await zip.generateAsync({ type: 'blob' });
-        const suffix = totalParts > 1 ? `_parte_${partIndex + 1}_de_${totalParts}` : '';
-        downloadBlob(blob, `shinobi_sprites_${contentMode}${suffix}.zip`);
       }
 
       if (controller.signal.aborted) {
@@ -179,7 +240,11 @@ export function BatchZipModal({
   };
 
   const pct =
-    progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+    progress.zipPercent !== null
+      ? progress.zipPercent
+      : progress.total > 0
+      ? Math.round((progress.done / progress.total) * 100)
+      : 0;
 
   return (
     <div
@@ -188,14 +253,14 @@ export function BatchZipModal({
       aria-labelledby="batch-zip-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
     >
-      <div className="w-full max-w-lg rounded-lg border border-slate-700 bg-[#131A26] p-6 space-y-5">
+      <div className="w-full max-w-lg rounded-lg border border-slate-700 bg-[#131A26] p-6 space-y-5 max-h-[92vh] overflow-y-auto">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h3 id="batch-zip-title" className="font-display text-lg font-semibold text-slate-50">
               {title}
             </h3>
             <p className="mt-1 text-xs text-slate-400 tabular-nums">
-              {ninjas.length} ninjas disponíveis na lista atual
+              {ninjas.length} ninjas disponíveis · Compactação em segundo plano (Web Worker)
             </p>
           </div>
           <button
@@ -257,8 +322,8 @@ export function BatchZipModal({
           </div>
         </div>
 
-        {/* Range and Chunk Split */}
-        <div className="grid grid-cols-3 gap-3 text-xs">
+        {/* Range, Chunk Split & Speed */}
+        <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
           <label className="space-y-1">
             <span className="text-slate-400">Do ninja</span>
             <input
@@ -284,7 +349,7 @@ export function BatchZipModal({
             />
           </label>
           <label className="space-y-1">
-            <span className="text-slate-400">Dividir ZIP a cada</span>
+            <span className="text-slate-400">Dividir ZIP</span>
             <select
               disabled={running}
               value={chunkSize}
@@ -297,16 +362,35 @@ export function BatchZipModal({
               <option value={0}>Arquivo único</option>
             </select>
           </label>
+          <label className="space-y-1">
+            <span className="text-slate-400">Velocidade</span>
+            <select
+              disabled={running}
+              value={concurrency}
+              onChange={(e) => setConcurrency(Number(e.target.value))}
+              className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-2 py-1.5 font-mono text-slate-100"
+            >
+              <option value={4}>Normal (4x)</option>
+              <option value={8}>Rápida (8x)</option>
+              <option value={12}>Turbo (12x)</option>
+            </select>
+          </label>
         </div>
 
         {(running || statusMessage) && (
           <div className="space-y-2 rounded-lg border border-slate-800 bg-[#0B0F17] p-3">
             <div className="flex items-center justify-between text-xs font-mono tabular-nums">
               <span className="text-slate-200 truncate">
-                {running ? `Processando ${progress.currentId}...` : statusMessage}
+                {progress.zipPercent !== null
+                  ? statusMessage || 'Empacotando ZIP...'
+                  : running
+                  ? `Baixando (${progress.ratePerSec}/s): ${progress.currentId}...`
+                  : statusMessage}
               </span>
               <span className="text-orange-400 shrink-0 ml-2">
-                {progress.done}/{progress.total} ({pct}%)
+                {progress.zipPercent !== null
+                  ? `${progress.zipPercent}%`
+                  : `${progress.done}/${progress.total} (${pct}%)`}
               </span>
             </div>
             <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">

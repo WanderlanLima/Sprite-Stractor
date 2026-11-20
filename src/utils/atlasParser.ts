@@ -1,12 +1,13 @@
-import JSZip from 'jszip';
 import type {
   AtlasPage,
   AtlasRegion,
   SlicedFrame,
+  SpineAnimationData,
   SpineAttachmentInfo,
   SpineBoneDef,
   SpineSkeleton,
 } from '../types/sprite';
+import { createZipWorkerSession } from './zipWorkerClient';
 
 export function parseAtlas(atlasText: string): AtlasPage[] {
   const lines = atlasText.split(/\r?\n/);
@@ -369,28 +370,48 @@ function makeLocalMat(
   };
 }
 
-export function renderSpineFrameToCanvas(
-  ctx: CanvasRenderingContext2D,
-  canvasWidth: number,
-  canvasHeight: number,
-  skeleton: SpineSkeleton,
-  animName: string,
-  time: number,
-  regionCanvasMap: Map<string, HTMLCanvasElement>,
-  zoom = 1,
-  panX = 0,
-  panY = 0
-): number {
-  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+export interface AnimationWorldBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  width: number;
+  height: number;
+  centerX: number;
+  centerY: number;
+}
 
-  const anim = skeleton.animations?.[animName];
-  const bonesDef = skeleton.bones || [];
-  const slotsDef = skeleton.slots || [];
-  const skinAttachments = getDefaultSkinAttachments(skeleton);
-
+function buildBoneMap(skeleton: SpineSkeleton): Map<string, SpineBoneDef> {
   const boneMap = new Map<string, SpineBoneDef>();
-  for (const b of bonesDef) boneMap.set(b.name, b);
+  for (const b of skeleton.bones || []) boneMap.set(b.name, b);
+  return boneMap;
+}
 
+function resolveSlotAttachmentAtTime(
+  slotName: string,
+  defaultAttachment: string | undefined,
+  anim: SpineAnimationData | undefined,
+  time: number
+): string | null | undefined {
+  let attachmentName: string | null | undefined = defaultAttachment;
+  const slotTimeline = anim?.slots?.[slotName]?.attachment;
+  if (slotTimeline && slotTimeline.length > 0) {
+    for (let i = 0; i < slotTimeline.length; i++) {
+      if ((slotTimeline[i].time || 0) <= time + 1e-5) {
+        attachmentName = slotTimeline[i].name ?? null;
+      } else {
+        break;
+      }
+    }
+  }
+  return attachmentName;
+}
+
+function createWorldMatrixResolver(
+  boneMap: Map<string, SpineBoneDef>,
+  anim: SpineAnimationData | undefined,
+  time: number
+) {
   const worldMatrices = new Map<string, Mat2D>();
   const getWorldMatrix = (boneName: string): Mat2D => {
     const cached = worldMatrices.get(boneName);
@@ -414,15 +435,174 @@ export function renderSpineFrameToCanvas(
     worldMatrices.set(boneName, world);
     return world;
   };
+  return getWorldMatrix;
+}
 
-  const skelBounds = skeleton.skeleton || {};
-  const skelW = Math.max(80, skelBounds.width || 160);
-  const skelH = Math.max(80, skelBounds.height || 160);
-  const baseScale = Math.min((canvasWidth * 0.72) / skelW, (canvasHeight * 0.72) / skelH);
-  const effectiveScale = Math.min(3.5, Math.max(0.4, baseScale)) * zoom;
+function collectSampleTimes(
+  anim: SpineAnimationData | undefined,
+  duration: number,
+  samples: number
+): number[] {
+  const times = new Set<number>();
+  const stepCount = Math.max(2, samples);
+  for (let s = 0; s < stepCount; s++) {
+    times.add(stepCount === 1 ? 0 : (s / (stepCount - 1)) * duration);
+  }
+  if (anim?.slots) {
+    for (const slotAnim of Object.values(anim.slots)) {
+      for (const kf of slotAnim.attachment || []) {
+        if (typeof kf.time === 'number') times.add(kf.time);
+      }
+    }
+  }
+  if (anim?.bones) {
+    for (const boneAnim of Object.values(anim.bones)) {
+      for (const kf of boneAnim.translate || []) {
+        if (typeof kf.time === 'number') times.add(kf.time);
+      }
+      for (const kf of boneAnim.rotate || []) {
+        if (typeof kf.time === 'number') times.add(kf.time);
+      }
+      for (const kf of boneAnim.scale || []) {
+        if (typeof kf.time === 'number') times.add(kf.time);
+      }
+    }
+  }
+  return Array.from(times).sort((a, b) => a - b);
+}
 
-  const anchorX = canvasWidth / 2 + panX;
-  const anchorY = canvasHeight * 0.76 + panY;
+export function computeAnimationWorldBounds(
+  skeleton: SpineSkeleton,
+  animName: string,
+  regionCanvasMap: Map<string, HTMLCanvasElement>,
+  samples = 24
+): AnimationWorldBounds {
+  const anim = skeleton.animations?.[animName];
+  const slotsDef = skeleton.slots || [];
+  const skinAttachments = getDefaultSkinAttachments(skeleton);
+  const boneMap = buildBoneMap(skeleton);
+  const duration = getAnimationDuration(skeleton, animName);
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+
+  const sampleTimes = collectSampleTimes(anim, duration, samples);
+  for (const t of sampleTimes) {
+    const getWorldMatrix = createWorldMatrixResolver(boneMap, anim, t);
+
+    for (const slot of slotsDef) {
+      const attachmentName = resolveSlotAttachmentAtTime(slot.name, slot.attachment, anim, t);
+      if (!attachmentName) continue;
+
+      const attInfo = skinAttachments[slot.name]?.[attachmentName];
+      const regionKey = attInfo?.path || attInfo?.name || attachmentName;
+      const spriteCanvas = regionCanvasMap.get(regionKey);
+      if (!spriteCanvas) continue;
+
+      const wm = getWorldMatrix(slot.bone);
+      const localMat = makeLocalMat(
+        attInfo?.x || 0,
+        attInfo?.y || 0,
+        attInfo?.rotation || 0,
+        attInfo?.scaleX ?? 1,
+        attInfo?.scaleY ?? 1
+      );
+      const finalMat = mulMat(wm, localMat);
+
+      const hw = (attInfo?.width || spriteCanvas.width) / 2;
+      const hh = (attInfo?.height || spriteCanvas.height) / 2;
+
+      const corners: Array<[number, number]> = [
+        [-hw, -hh],
+        [hw, -hh],
+        [hw, hh],
+        [-hw, hh],
+      ];
+      for (const [cx, cy] of corners) {
+        const wx = finalMat.a * cx + finalMat.c * cy + finalMat.tx;
+        const wy = finalMat.b * cx + finalMat.d * cy + finalMat.ty;
+        if (wx < minX) minX = wx;
+        if (wx > maxX) maxX = wx;
+        if (wy < minY) minY = wy;
+        if (wy > maxY) maxY = wy;
+      }
+    }
+  }
+
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+    const skelW = Math.max(80, skeleton.skeleton?.width || 160);
+    const skelH = Math.max(80, skeleton.skeleton?.height || 160);
+    return {
+      minX: -skelW / 2,
+      maxX: skelW / 2,
+      minY: 0,
+      maxY: skelH,
+      width: skelW,
+      height: skelH,
+      centerX: 0,
+      centerY: skelH / 2,
+    };
+  }
+
+  const width = Math.max(16, maxX - minX);
+  const height = Math.max(16, maxY - minY);
+  return {
+    minX,
+    maxX,
+    minY,
+    maxY,
+    width,
+    height,
+    centerX: (minX + maxX) / 2,
+    centerY: (minY + maxY) / 2,
+  };
+}
+
+export function renderSpineFrameToCanvas(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  skeleton: SpineSkeleton,
+  animName: string,
+  time: number,
+  regionCanvasMap: Map<string, HTMLCanvasElement>,
+  zoom = 1,
+  panX = 0,
+  panY = 0,
+  autoFitBounds?: AnimationWorldBounds | null
+): number {
+  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+  const anim = skeleton.animations?.[animName];
+  const slotsDef = skeleton.slots || [];
+  const skinAttachments = getDefaultSkinAttachments(skeleton);
+  const boneMap = buildBoneMap(skeleton);
+  const getWorldMatrix = createWorldMatrixResolver(boneMap, anim, time);
+
+  let effectiveScale: number;
+  let anchorX: number;
+  let anchorY: number;
+
+  if (autoFitBounds) {
+    const fitScale = Math.min(
+      (canvasWidth * 0.86) / autoFitBounds.width,
+      (canvasHeight * 0.86) / autoFitBounds.height
+    );
+    const baseScale = Math.min(4.0, Math.max(0.08, fitScale));
+    effectiveScale = baseScale * zoom;
+    anchorX = canvasWidth / 2 - autoFitBounds.centerX * effectiveScale + panX;
+    anchorY = canvasHeight / 2 + autoFitBounds.centerY * effectiveScale + panY;
+  } else {
+    const skelBounds = skeleton.skeleton || {};
+    const skelW = Math.max(80, skelBounds.width || 160);
+    const skelH = Math.max(80, skelBounds.height || 160);
+    const baseScale = Math.min((canvasWidth * 0.72) / skelW, (canvasHeight * 0.72) / skelH);
+    effectiveScale = Math.min(3.5, Math.max(0.15, baseScale)) * zoom;
+    anchorX = canvasWidth / 2 + panX;
+    anchorY = canvasHeight * 0.76 + panY;
+  }
 
   let drawnSlots = 0;
 
@@ -674,6 +854,17 @@ export function downloadBlob(blob: Blob, filename: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function dataUrlToUint8Array(dataUrl: string): Uint8Array | null {
+  const base64 = dataUrl.split(',')[1];
+  if (!base64) return null;
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return bytes;
+}
+
 export async function exportFramesAsZip(
   zipFilename: string,
   frames: SlicedFrame[],
@@ -684,25 +875,79 @@ export async function exportFramesAsZip(
     skeletonName?: string;
   }
 ) {
-  const zip = new JSZip();
-  const folder = zip.folder('frames');
-  if (folder) {
+  const session = createZipWorkerSession();
+  try {
+    const batch: Array<{ path: string; data: Uint8Array | string }> = [];
     for (const f of frames) {
-      const base64 = f.dataUrl.split(',')[1];
-      if (base64) {
-        folder.file(`${f.name}.png`, base64, { base64: true });
+      const bytes = dataUrlToUint8Array(f.dataUrl);
+      if (bytes) {
+        batch.push({ path: `frames/${f.name}.png`, data: bytes });
       }
     }
+    if (extras?.atlasText && extras.atlasName) {
+      batch.push({ path: extras.atlasName, data: extras.atlasText });
+    }
+    if (extras?.skeletonJson && extras.skeletonName) {
+      batch.push({
+        path: extras.skeletonName,
+        data: JSON.stringify(extras.skeletonJson, null, 2),
+      });
+    }
+    await session.addFilesBatch(batch);
+    const blob = await session.generateBlob(undefined, 'STORE');
+    downloadBlob(blob, zipFilename);
+  } finally {
+    session.dispose();
   }
-  if (extras?.atlasText && extras.atlasName) {
-    zip.file(extras.atlasName, extras.atlasText);
-  }
-  if (extras?.skeletonJson && extras.skeletonName) {
-    zip.file(extras.skeletonName, JSON.stringify(extras.skeletonJson, null, 2));
+}
+
+export function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => resolve(blob), 'image/png');
+  });
+}
+
+export async function extractRegionToPngBlob(
+  region: AtlasRegion,
+  pageImage: HTMLImageElement
+): Promise<Blob | null> {
+  const outW = Math.max(1, region.origWidth || region.width);
+  const outH = Math.max(1, region.origHeight || region.height);
+  const isRotated90 = region.rotate === 90;
+  const srcW = isRotated90 ? region.height : region.width;
+  const srcH = isRotated90 ? region.width : region.height;
+  const destX = region.offsetX || 0;
+  const destY = Math.max(0, outH - (region.offsetY || 0) - region.height);
+
+  if (typeof OffscreenCanvas !== 'undefined') {
+    const off = new OffscreenCanvas(outW, outH);
+    const ctx = off.getContext('2d');
+    if (ctx) {
+      ctx.save();
+      if (isRotated90) {
+        ctx.translate(destX, destY + region.height);
+        ctx.rotate(-Math.PI / 2);
+        ctx.drawImage(pageImage, region.x, region.y, srcW, srcH, 0, 0, srcW, srcH);
+      } else {
+        ctx.drawImage(
+          pageImage,
+          region.x,
+          region.y,
+          srcW,
+          srcH,
+          destX,
+          destY,
+          region.width,
+          region.height
+        );
+      }
+      ctx.restore();
+      return await off.convertToBlob({ type: 'image/png' });
+    }
   }
 
-  const blob = await zip.generateAsync({ type: 'blob' });
-  downloadBlob(blob, zipFilename);
+  const canvas = extractRegionToCanvas(region, pageImage);
+  return await canvasToPngBlob(canvas);
 }
 
 export function exportAnimationStripPng(
@@ -713,8 +958,9 @@ export function exportAnimationStripPng(
 ): { dataUrl: string; frameCount: number; cellWidth: number; cellHeight: number } {
   const duration = getAnimationDuration(skeleton, animName);
   const frameCount = Math.max(1, Math.min(60, Math.round(duration * fps)));
-  const cellW = Math.max(128, Math.ceil((skeleton.skeleton?.width || 140) * 1.6));
-  const cellH = Math.max(128, Math.ceil((skeleton.skeleton?.height || 140) * 1.6));
+  const bounds = computeAnimationWorldBounds(skeleton, animName, regionCanvasMap, 24);
+  const cellW = Math.max(128, Math.min(512, Math.ceil(bounds.width * 1.16)));
+  const cellH = Math.max(128, Math.min(512, Math.ceil(bounds.height * 1.16)));
 
   const cols = Math.min(frameCount, 8);
   const rows = Math.ceil(frameCount / cols);
@@ -732,7 +978,19 @@ export function exportAnimationStripPng(
   if (sheetCtx && frameCtx) {
     for (let i = 0; i < frameCount; i++) {
       const t = frameCount === 1 ? 0 : (i / frameCount) * duration;
-      renderSpineFrameToCanvas(frameCtx, cellW, cellH, skeleton, animName, t, regionCanvasMap, 1);
+      renderSpineFrameToCanvas(
+        frameCtx,
+        cellW,
+        cellH,
+        skeleton,
+        animName,
+        t,
+        regionCanvasMap,
+        1,
+        0,
+        0,
+        bounds
+      );
       const col = i % cols;
       const row = Math.floor(i / cols);
       sheetCtx.drawImage(frameCanvas, col * cellW, row * cellH);

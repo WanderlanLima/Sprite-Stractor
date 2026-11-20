@@ -104,6 +104,68 @@ async function fetchNinjaThumbnail(ninja: NinjaEntry): Promise<string | null> {
   return promise;
 }
 
+function NinjaThumbCanvas({
+  src,
+  alt,
+  onError,
+}: {
+  src: string;
+  alt: string;
+  onError: () => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  useEffect(() => {
+    let cancelled = false;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.referrerPolicy = 'no-referrer';
+    img.onload = () => {
+      if (cancelled) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const cssW = 160;
+      const cssH = 128;
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+
+      const scale = Math.min(cssW / Math.max(1, img.width), cssH / Math.max(1, img.height));
+      const drawW = img.width * scale;
+      const drawH = img.height * scale;
+      const dx = (cssW - drawW) / 2;
+      const dy = (cssH - drawH) / 2;
+      ctx.drawImage(img, dx, dy, drawW, drawH);
+    };
+    img.onerror = () => {
+      if (!cancelled) onErrorRef.current();
+    };
+    img.src = src;
+
+    return () => {
+      cancelled = true;
+    };
+  }, [src]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      aria-label={alt}
+      role="img"
+      className="h-32 w-40 max-h-full max-w-full object-contain transition-transform duration-200 group-hover:scale-105"
+    />
+  );
+}
+
 function NinjaCard({
   ninja,
   isSelected,
@@ -188,13 +250,19 @@ function NinjaCard({
     >
       <div className="sprite-checkerboard relative flex h-36 w-full items-center justify-center overflow-hidden border-b border-slate-800/80 p-3">
         {thumbUrl ? (
-          <img
+          <NinjaThumbCanvas
             src={thumbUrl}
             alt={`Sprite ${ninja.id}`}
-            loading="lazy"
-            referrerPolicy="no-referrer"
-            onError={() => setThumbUrl(null)}
-            className="max-h-full max-w-full object-contain transition-transform duration-200 group-hover:scale-105"
+            onError={() => {
+              // If fast remote crop fails, fall back once to full-atlas canvas extraction
+              if (!thumbUrl.startsWith('data:')) {
+                void fetchNinjaThumbnail(ninja).then((fallbackUrl) => {
+                  setThumbUrl(fallbackUrl);
+                });
+              } else {
+                setThumbUrl(null);
+              }
+            }}
           />
         ) : (
           <div className="flex flex-col items-center gap-2 text-slate-500">

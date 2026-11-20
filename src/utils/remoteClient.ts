@@ -22,6 +22,7 @@ interface IdleMapEntry {
   w: number;
   h: number;
   r: number;
+  s?: number;
 }
 
 interface StaticAtlasPack {
@@ -30,6 +31,32 @@ interface StaticAtlasPack {
 }
 
 let staticPackPromise: Promise<StaticAtlasPack | null> | null = null;
+const skeletonChunkCache = new Map<number, Promise<JSZip | null>>();
+
+async function loadStaticSkeleton(ninjaId: string, chunkIndex: number): Promise<SpineSkeleton | null> {
+  let chunkPromise = skeletonChunkCache.get(chunkIndex);
+  if (!chunkPromise) {
+    chunkPromise = (async () => {
+      try {
+        const resp = await fetch(`./data/skeletons/skel-${chunkIndex}.zip`);
+        if (!resp.ok) return null;
+        const buf = await resp.arrayBuffer();
+        return await JSZip.loadAsync(buf);
+      } catch {
+        return null;
+      }
+    })();
+    skeletonChunkCache.set(chunkIndex, chunkPromise);
+  }
+  const zip = await chunkPromise;
+  const file = zip?.file(`${ninjaId}.json`);
+  if (!file) return null;
+  try {
+    return JSON.parse(await file.async('text')) as SpineSkeleton;
+  } catch {
+    return null;
+  }
+}
 
 async function loadStaticAtlasPack(): Promise<StaticAtlasPack | null> {
   if (!staticPackPromise) {
@@ -129,7 +156,8 @@ export async function resolveStaticNinjaThumbUrl(ninja: NinjaEntry): Promise<str
       return null;
     }
     const rotateParam = entry.r === 90 ? '&ro=270' : '';
-    return `https://wsrv.nl/?url=${encodeURIComponent(pageUrl)}&cx=${entry.x}&cy=${entry.y}&cw=${entry.w}&ch=${entry.h}${rotateParam}&w=144&h=144&fit=inside&output=png`;
+    // Do NOT pass &w=&h= alongside &cx=&cy=&cw=&ch= because wsrv.nl resizes before cropping.
+    return `https://wsrv.nl/?url=${encodeURIComponent(pageUrl)}&cx=${entry.x}&cy=${entry.y}&cw=${entry.w}&ch=${entry.h}${rotateParam}&output=png`;
   } catch {
     return null;
   }
@@ -293,17 +321,20 @@ export async function fetchNinjaBundle(
     }
   }
 
-  // Static GitHub Pages mode: first try bundled compressed atlas pack (zero rate limits!)
+  // Static GitHub Pages mode: first try bundled compressed atlas & skeleton packs (zero rate limits!)
   const ninjaId = extractNinjaIdFromAtlasUrl(atlasUrl);
   let atlasText = '';
   let idleFrameName: string | undefined;
+  let skeletonChunkIdx: number | undefined;
 
   if (ninjaId) {
     const pack = await loadStaticAtlasPack();
     const packedAtlas = pack?.zip.file(`atlas/${ninjaId}.atlas`);
     if (packedAtlas) {
       atlasText = await packedAtlas.async('text');
-      idleFrameName = pack?.idleMap[ninjaId]?.frame;
+      const entry = pack?.idleMap[ninjaId];
+      idleFrameName = entry?.frame;
+      skeletonChunkIdx = entry?.s;
     }
   }
 
@@ -318,13 +349,18 @@ export async function fetchNinjaBundle(
   }
 
   let skeleton: SpineSkeleton | null = null;
-  if (!options?.skipSkeleton && skeletonUrl) {
-    const skelResp = await fetchTextViaRelays(skeletonUrl, 4500);
-    if (skelResp) {
-      try {
-        skeleton = (await skelResp.json()) as SpineSkeleton;
-      } catch {
-        skeleton = null;
+  if (!options?.skipSkeleton) {
+    if (ninjaId && typeof skeletonChunkIdx === 'number') {
+      skeleton = await loadStaticSkeleton(ninjaId, skeletonChunkIdx);
+    }
+    if (!skeleton && skeletonUrl) {
+      const skelResp = await fetchTextViaRelays(skeletonUrl, 4500);
+      if (skelResp) {
+        try {
+          skeleton = (await skelResp.json()) as SpineSkeleton;
+        } catch {
+          skeleton = null;
+        }
       }
     }
   }

@@ -365,7 +365,7 @@ export default function App() {
                         Relay CORS para Modo Estático {isStaticHostingMode() ? '(Ativo)' : '(Opcional)'}
                       </h3>
                       <p className="text-slate-400">
-                        No GitHub Pages, as miniaturas, frames fatiados e o download em ZIP de todos os 695 ninjas funcionam automaticamente via pacote estático + CDN <code className="font-mono text-slate-200">wsrv.nl</code> (sem erro 429). Preencha abaixo apenas se quiser usar um Worker/proxy próprio para extrair outras URLs ou animações <code className="font-mono text-slate-200">.json</code>:
+                        No GitHub Pages, o catálogo, miniaturas, animações Spine (<code className="font-mono text-slate-200">.json</code>), frames fatiados e o download em ZIP de todos os 695 ninjas funcionam automaticamente via pacotes estáticos + CDN <code className="font-mono text-slate-200">wsrv.nl</code>. Preencha abaixo apenas se quiser extrair URLs de outros jogos:
                       </p>
                       <div className="flex gap-2">
                         <input
