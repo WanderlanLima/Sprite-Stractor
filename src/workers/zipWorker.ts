@@ -53,10 +53,19 @@ self.onmessage = async (event: MessageEvent<ZipWorkerInMessage>) => {
         }
       );
 
-      // Copy into a cleanly owned ArrayBuffer for zero-copy transfer
-      const outCopy = new Uint8Array(uint8.byteLength);
-      outCopy.set(uint8);
-      const outBuffer: ArrayBuffer = outCopy.buffer;
+      // Transfer directly when tightly sized to avoid duplicating huge buffers in RAM
+      let outBuffer: ArrayBuffer;
+      if (
+        uint8.byteOffset === 0 &&
+        uint8.byteLength === uint8.buffer.byteLength &&
+        uint8.buffer instanceof ArrayBuffer
+      ) {
+        outBuffer = uint8.buffer;
+      } else {
+        const outCopy = new Uint8Array(uint8.byteLength);
+        outCopy.set(uint8);
+        outBuffer = outCopy.buffer;
+      }
       (self as unknown as Worker).postMessage(
         { type: 'done', buffer: outBuffer } satisfies ZipWorkerOutMessage,
         [outBuffer]

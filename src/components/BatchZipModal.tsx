@@ -1,5 +1,14 @@
-import { useRef, useState } from 'react';
-import { Download, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import {
+  Download,
+  HardDriveDownload,
+  Pause,
+  Play,
+  RotateCcw,
+  Trash2,
+  WifiOff,
+  X,
+} from 'lucide-react';
 import type { NinjaEntry } from '../types/sprite';
 import {
   downloadBlob,
@@ -7,8 +16,22 @@ import {
   loadImageElement,
   parseAtlas,
 } from '../utils/atlasParser';
+import {
+  type BatchContentMode,
+  type BatchJobRecord,
+  type StoredNinjaFileRecord,
+  clearAllBatchJobs,
+  countEntriesInRange,
+  createBatchJob,
+  formatBytesCompact,
+  getLatestBatchJob,
+  iterateJobZipEntries,
+  prepareFileRecord,
+  saveBatchJobRecord,
+  saveNinjaFilesToStore,
+} from '../utils/batchDownloadStore';
 import { fetchNinjaBundle } from '../utils/remoteClient';
-import { createZipWorkerSession, type ZipWorkerSession } from '../utils/zipWorkerClient';
+import { assembleStreamingZipBlob, streamZipToWritable } from '../utils/streamingZip';
 
 interface BatchZipModalProps {
   isOpen: boolean;
@@ -17,7 +40,108 @@ interface BatchZipModalProps {
   onClose: () => void;
 }
 
-type BatchContentMode = 'idle-only' | 'all-sliced' | 'raw-bundle';
+type PauseReason = 'user' | 'network' | null;
+
+interface SaveFilePickerWindow extends Window {
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string;
+    types?: Array<{
+      description?: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<{
+    createWritable: () => Promise<{
+      write(data: BufferSource | Blob): Promise<void>;
+      close(): Promise<void>;
+    }>;
+  }>;
+}
+
+function isLikelyNetworkError(err: unknown): boolean {
+  if (!navigator.onLine) return true;
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return (
+    err.name === 'TypeError' ||
+    err.name === 'TimeoutError' ||
+    msg.includes('failed to fetch') ||
+    msg.includes('network') ||
+    msg.includes('load failed') ||
+    msg.includes('err_internet') ||
+    msg.includes('falha ao carregar imagem') ||
+    msg.includes('http 5') ||
+    msg.includes('http 429')
+  );
+}
+
+async function loadImageWithRetry(
+  url: string,
+  signal: AbortSignal,
+  attempts = 3
+): Promise<HTMLImageElement> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    try {
+      return await loadImageElement(url);
+    } catch (err) {
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      lastErr = err;
+      if (attempt < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(`Falha ao carregar imagem: ${url}`);
+}
+
+async function fetchBufferWithRetry(
+  url: string,
+  signal: AbortSignal,
+  attempts = 3
+): Promise<ArrayBuffer> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    try {
+      const resp = await fetch(url, { signal });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      return await resp.arrayBuffer();
+    } catch (err) {
+      if (signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+        throw err;
+      }
+      lastErr = err;
+      if (attempt < attempts - 1) {
+        const delay = 500 * (attempt + 1) * (attempt + 1);
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort);
+            resolve();
+          }, delay);
+          const onAbort = () => {
+            clearTimeout(t);
+            reject(new DOMException('Aborted', 'AbortError'));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+        });
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('Falha ao baixar arquivo.');
+}
+
+const MODE_LABELS: Record<BatchContentMode, string> = {
+  'idle-only': '1 Sprite Principal (PNG)',
+  'all-sliced': 'Todos os Frames Fatiados',
+  'raw-bundle': 'Pacotes Originais (.webp + .atlas + .json)',
+};
 
 export function BatchZipModal({
   isOpen,
@@ -31,91 +155,306 @@ export function BatchZipModal({
   const [chunkSize, setChunkSize] = useState<number>(100);
   const [concurrency, setConcurrency] = useState<number>(8);
 
+  const [savedJob, setSavedJob] = useState<BatchJobRecord | null>(null);
   const [running, setRunning] = useState(false);
+  const [packaging, setPackaging] = useState(false);
+  const [pausedByNetwork, setPausedByNetwork] = useState(false);
+
   const [progress, setProgress] = useState({
     done: 0,
     total: 0,
     currentId: '',
     errors: 0,
     ratePerSec: 0,
+    savedBytes: 0,
     zipPercent: null as number | null,
   });
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
   const abortRef = useRef<AbortController | null>(null);
+  const pauseReasonRef = useRef<PauseReason>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    if (ninjas.length > 0 && endIdx === 0) {
+      setEndIdx(ninjas.length);
+    }
+    let active = true;
+    void getLatestBatchJob().then((job) => {
+      if (!active || !job) return;
+      setSavedJob(job);
+      if (job.status === 'paused') {
+        setContentMode(job.contentMode);
+        setStartIdx(job.startIdx);
+        setEndIdx(job.endIdx);
+        setChunkSize(job.chunkSize);
+        setProgress({
+          done: job.completedIndices.length,
+          total: job.totalNinjas,
+          currentId: '',
+          errors: job.failedIndices.length,
+          ratePerSec: 0,
+          savedBytes: job.totalBytes,
+          zipPercent: null,
+        });
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [isOpen, ninjas.length, endIdx]);
 
   if (!isOpen) return null;
 
   const safeStart = Math.max(1, Math.min(startIdx, ninjas.length));
   const safeEnd = Math.max(safeStart, Math.min(endIdx || ninjas.length, ninjas.length));
   const targetList = ninjas.slice(safeStart - 1, safeEnd);
+  const supportsSavePicker =
+    typeof window !== 'undefined' &&
+    typeof (window as SaveFilePickerWindow).showSaveFilePicker === 'function';
 
-  const handleCancel = () => {
+  const handlePause = () => {
+    pauseReasonRef.current = 'user';
     abortRef.current?.abort();
   };
 
-  const handleStartDownload = async () => {
-    if (targetList.length === 0) return;
+  const handleDiscardSaved = async () => {
+    await clearAllBatchJobs();
+    setSavedJob(null);
+    setPausedByNetwork(false);
+    setStatusMessage(null);
+    setProgress({
+      done: 0,
+      total: 0,
+      currentId: '',
+      errors: 0,
+      ratePerSec: 0,
+      savedBytes: 0,
+      zipPercent: null,
+    });
+  };
+
+  const packageRangeToZip = async (
+    job: BatchJobRecord,
+    rangeStart: number,
+    rangeEnd: number,
+    filename: string,
+    partLabel?: string
+  ) => {
+    setPackaging(true);
+    setStatusMessage(
+      partLabel
+        ? `Gerando ${partLabel} sem uso excessivo de memória...`
+        : 'Gerando arquivo ZIP em fluxo contínuo...'
+    );
+    setProgress((prev) => ({ ...prev, zipPercent: 0 }));
+
+    const entryEstimate = await countEntriesInRange(job.id, rangeStart, rangeEnd);
+    const zipBlob = await assembleStreamingZipBlob(
+      () => iterateJobZipEntries(job.id, rangeStart, rangeEnd),
+      entryEstimate,
+      (pct) => setProgress((prev) => ({ ...prev, zipPercent: pct }))
+    );
+
+    downloadBlob(zipBlob, filename);
+  };
+
+  const handleDirectSaveToDisk = async (job: BatchJobRecord) => {
+    const pickerFn = (window as SaveFilePickerWindow).showSaveFilePicker;
+    if (!pickerFn) return;
+
+    const filename = `shinobi_sprites_${job.contentMode}_${job.startIdx}_a_${job.endIdx}.zip`;
+    try {
+      const handle = await pickerFn({
+        suggestedName: filename,
+        types: [
+          {
+            description: 'Arquivo ZIP',
+            accept: { 'application/zip': ['.zip'] },
+          },
+        ],
+      });
+      setPackaging(true);
+      setStatusMessage('Gravando ZIP direto no disco...');
+      setProgress((prev) => ({ ...prev, zipPercent: 0 }));
+
+      const writable = await handle.createWritable();
+      const entryEstimate = await countEntriesInRange(job.id, 0, job.totalNinjas);
+      await streamZipToWritable(
+        () => iterateJobZipEntries(job.id, 0, job.totalNinjas),
+        writable,
+        entryEstimate,
+        (pct) => setProgress((prev) => ({ ...prev, zipPercent: pct }))
+      );
+
+      setStatusMessage(`Arquivo "${filename}" salvo diretamente no disco com sucesso!`);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      setStatusMessage(
+        err instanceof Error ? err.message : 'Não foi possível gravar direto no disco.'
+      );
+    } finally {
+      setPackaging(false);
+    }
+  };
+
+  const handleReexportSaved = async (job: BatchJobRecord, partialLabel?: string) => {
+    try {
+      const suffix = partialLabel ? `_${partialLabel}` : '';
+      const filename = `shinobi_sprites_${job.contentMode}_${job.startIdx}_a_${job.endIdx}${suffix}.zip`;
+      await packageRangeToZip(job, 0, job.totalNinjas, filename);
+      setStatusMessage(
+        `ZIP gerado (${job.completedIndices.length} ninjas · ${formatBytesCompact(job.totalBytes)}). Se o navegador bloqueou o pop-up, clique em "Baixar ZIP".`
+      );
+    } catch (err) {
+      setStatusMessage(
+        err instanceof Error ? err.message : 'Erro ao montar arquivo ZIP a partir do cache.'
+      );
+    } finally {
+      setPackaging(false);
+    }
+  };
+
+  const runJob = async (existingJob?: BatchJobRecord) => {
+    const activeMode = existingJob ? existingJob.contentMode : contentMode;
+    const activeStart = existingJob ? existingJob.startIdx : safeStart;
+    const activeEnd = existingJob ? existingJob.endIdx : safeEnd;
+    const activeChunk = existingJob ? existingJob.chunkSize : chunkSize;
+    const activeList = ninjas.slice(activeStart - 1, activeEnd);
+
+    if (activeList.length === 0) return;
 
     const controller = new AbortController();
     abortRef.current = controller;
+    pauseReasonRef.current = null;
+    setPausedByNetwork(false);
     setRunning(true);
+    setPackaging(false);
     setStatusMessage(null);
 
+    const onOffline = () => {
+      pauseReasonRef.current = 'network';
+      controller.abort();
+    };
+    window.addEventListener('offline', onOffline);
+
+    const job: BatchJobRecord = existingJob
+      ? { ...existingJob, status: 'running' }
+      : await createBatchJob({
+          contentMode: activeMode,
+          startIdx: activeStart,
+          endIdx: activeEnd,
+          chunkSize: activeChunk,
+          totalNinjas: activeList.length,
+        });
+
+    if (existingJob) {
+      await saveBatchJobRecord(job);
+    }
+    setSavedJob(job);
+
+    const completedSet = new Set<number>(job.completedIndices);
+    const failedSet = new Set<number>(job.failedIndices);
+    const exportedPartsSet = new Set<number>(job.exportedParts);
+
     const effectiveChunk =
-      chunkSize <= 0 ? targetList.length : Math.max(10, chunkSize);
-    const totalParts = Math.ceil(targetList.length / effectiveChunk);
+      activeChunk <= 0 ? activeList.length : Math.max(10, activeChunk);
+    const totalParts = Math.ceil(activeList.length / effectiveChunk);
     const workers = Math.max(1, Math.min(16, concurrency));
 
     const startedAt = performance.now();
-    let done = 0;
-    let errors = 0;
+    const initialDone = completedSet.size;
+    let sessionDone = 0;
+    let totalBytes = job.totalBytes;
+    let consecutiveNetErrors = 0;
+
     setProgress({
-      done: 0,
-      total: targetList.length,
-      currentId: targetList[0].id,
-      errors: 0,
+      done: completedSet.size,
+      total: activeList.length,
+      currentId: activeList[Math.min(completedSet.size, activeList.length - 1)]?.id || '',
+      errors: failedSet.size,
       ratePerSec: 0,
+      savedBytes: totalBytes,
       zipPercent: null,
     });
 
-    const processOneNinja = async (ninja: NinjaEntry, session: ZipWorkerSession) => {
-      if (controller.signal.aborted) return;
-      try {
-        const bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl, {
-          skipSkeleton: contentMode === 'idle-only',
+    const persistJobProgress = (() => {
+      let queue: Promise<void> = Promise.resolve();
+      let inFlight = false;
+      return (force = false) => {
+        if (inFlight && !force) return queue;
+        queue = queue.then(async () => {
+          inFlight = true;
+          try {
+            job.completedIndices = Array.from(completedSet).sort((a, b) => a - b);
+            job.failedIndices = Array.from(failedSet).sort((a, b) => a - b);
+            job.exportedParts = Array.from(exportedPartsSet).sort((a, b) => a - b);
+            job.totalBytes = totalBytes;
+            await saveBatchJobRecord(job);
+            setSavedJob({ ...job });
+          } finally {
+            inFlight = false;
+          }
         });
+        return queue;
+      };
+    })();
+
+    const processOneNinja = async (ninjaIndex: number, ninja: NinjaEntry) => {
+      if (controller.signal.aborted || completedSet.has(ninjaIndex)) return;
+
+      try {
+        // Retry bundle fetch up to 3 times on transient network failures
+        let bundle: Awaited<ReturnType<typeof fetchNinjaBundle>> | null = null;
+        let bundleErr: unknown = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (controller.signal.aborted) return;
+          try {
+            bundle = await fetchNinjaBundle(ninja.atlasUrl, ninja.skeletonUrl, {
+              skipSkeleton: activeMode === 'idle-only',
+            });
+            break;
+          } catch (err) {
+            bundleErr = err;
+            if (attempt < 2 && isLikelyNetworkError(err)) {
+              await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+            } else {
+              break;
+            }
+          }
+        }
+        if (!bundle) throw bundleErr ?? new Error('Falha ao carregar pacote do ninja.');
         if (controller.signal.aborted) return;
 
         const pages = parseAtlas(bundle.atlasText);
-        const batch: Array<{ path: string; data: Blob | ArrayBuffer | string }> = [];
+        const rawItems: Array<{ path: string; data: Blob | ArrayBuffer | string }> = [];
 
-        if (contentMode === 'raw-bundle') {
-          batch.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
+        if (activeMode === 'raw-bundle') {
+          rawItems.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
           if (bundle.skeleton) {
-            batch.push({
+            rawItems.push({
               path: `${ninja.id}/${ninja.id}.json`,
               data: JSON.stringify(bundle.skeleton),
             });
           }
-          await Promise.all(
-            Object.entries(bundle.pageUrls).map(async ([pageName, proxyUrl]) => {
-              const resp = await fetch(proxyUrl, { signal: controller.signal });
-              if (resp.ok) {
-                const buf = await resp.arrayBuffer();
-                batch.push({ path: `${ninja.id}/${pageName}`, data: buf });
-              }
+          const sheetEntries = Object.entries(bundle.pageUrls);
+          const downloadedSheets = await Promise.all(
+            sheetEntries.map(async ([pageName, proxyUrl]) => {
+              const buf = await fetchBufferWithRetry(proxyUrl, controller.signal, 3);
+              return { path: `${ninja.id}/${pageName}`, data: buf };
             })
           );
+          rawItems.push(...downloadedSheets);
         } else {
           const pageImages: Record<string, HTMLImageElement> = {};
           await Promise.all(
             Object.entries(bundle.pageUrls).map(async ([pageName, proxyUrl]) => {
-              pageImages[pageName] = await loadImageElement(proxyUrl);
+              pageImages[pageName] = await loadImageWithRetry(proxyUrl, controller.signal, 3);
             })
           );
           if (controller.signal.aborted) return;
 
-          if (contentMode === 'idle-only') {
+          if (activeMode === 'idle-only') {
             const allRegions = pages.flatMap((p) => p.regions);
             if (allRegions.length > 0) {
               let targetRegionName = bundle.idleFrameName || allRegions[0].name;
@@ -135,7 +474,7 @@ export function BatchZipModal({
               if (img) {
                 const blob = await extractRegionToPngBlob(region, img);
                 if (blob) {
-                  batch.push({ path: `${ninja.id}.png`, data: blob });
+                  rawItems.push({ path: `${ninja.id}.png`, data: blob });
                 }
               }
             }
@@ -152,12 +491,12 @@ export function BatchZipModal({
                 })
               );
               for (const item of blobs) {
-                if (item) batch.push(item);
+                if (item) rawItems.push(item);
               }
             }
-            batch.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
+            rawItems.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
             if (bundle.skeleton) {
-              batch.push({
+              rawItems.push({
                 path: `${ninja.id}/${ninja.id}.json`,
                 data: JSON.stringify(bundle.skeleton),
               });
@@ -165,75 +504,133 @@ export function BatchZipModal({
           }
         }
 
-        if (batch.length > 0 && !controller.signal.aborted) {
-          await session.addFilesBatch(batch);
+        if (controller.signal.aborted) return;
+
+        const preparedRecords: StoredNinjaFileRecord[] = await Promise.all(
+          rawItems.map((item) => prepareFileRecord(item.path, item.data))
+        );
+
+        const ninjaBytes = await saveNinjaFilesToStore(
+          job.id,
+          ninjaIndex,
+          ninja.id,
+          preparedRecords
+        );
+
+        consecutiveNetErrors = 0;
+        completedSet.add(ninjaIndex);
+        failedSet.delete(ninjaIndex);
+        totalBytes += ninjaBytes;
+        sessionDone++;
+
+        if (sessionDone % 5 === 0) {
+          await persistJobProgress();
         }
-      } catch {
-        errors++;
+      } catch (err) {
+        if (controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+          return;
+        }
+        if (isLikelyNetworkError(err)) {
+          consecutiveNetErrors++;
+          if (consecutiveNetErrors >= 5) {
+            pauseReasonRef.current = 'network';
+            controller.abort();
+            return;
+          }
+        } else {
+          consecutiveNetErrors = 0;
+          failedSet.add(ninjaIndex);
+        }
       } finally {
-        done++;
-        const elapsedSec = Math.max(0.2, (performance.now() - startedAt) / 1000);
-        setProgress({
-          done,
-          total: targetList.length,
+        const elapsedSec = Math.max(0.25, (performance.now() - startedAt) / 1000);
+        const rate = Number(((completedSet.size - initialDone) / elapsedSec).toFixed(1));
+        setProgress((prev) => ({
+          ...prev,
+          done: completedSet.size,
           currentId: ninja.id,
-          errors,
-          ratePerSec: Number((done / elapsedSec).toFixed(1)),
-          zipPercent: null,
-        });
+          errors: failedSet.size,
+          ratePerSec: Math.max(0, rate),
+          savedBytes: totalBytes,
+        }));
       }
     };
 
     try {
       for (let partIndex = 0; partIndex < totalParts; partIndex++) {
         if (controller.signal.aborted) break;
+        if (exportedPartsSet.has(partIndex)) continue;
 
-        const slice = targetList.slice(
-          partIndex * effectiveChunk,
-          (partIndex + 1) * effectiveChunk
-        );
-        const session = createZipWorkerSession();
+        const partStart = partIndex * effectiveChunk;
+        const partEnd = Math.min(activeList.length, (partIndex + 1) * effectiveChunk);
 
-        try {
+        const pendingIndices: number[] = [];
+        for (let idx = partStart; idx < partEnd; idx++) {
+          if (!completedSet.has(idx) && !failedSet.has(idx)) {
+            pendingIndices.push(idx);
+          }
+        }
+
+        if (pendingIndices.length > 0) {
           let cursor = 0;
           const runWorker = async () => {
             while (!controller.signal.aborted) {
-              const idx = cursor++;
-              if (idx >= slice.length) break;
-              await processOneNinja(slice[idx], session);
+              const pos = cursor++;
+              if (pos >= pendingIndices.length) break;
+              const ninjaIndex = pendingIndices[pos];
+              await processOneNinja(ninjaIndex, activeList[ninjaIndex]);
             }
           };
 
           await Promise.all(
-            Array.from({ length: Math.min(workers, slice.length) }, () => runWorker())
+            Array.from({ length: Math.min(workers, pendingIndices.length) }, () => runWorker())
           );
-
-          if (controller.signal.aborted) break;
-
-          setStatusMessage(
-            totalParts > 1
-              ? `Compactando em segundo plano (parte ${partIndex + 1} de ${totalParts})...`
-              : 'Compactando ZIP em segundo plano...'
-          );
-
-          const blob = await session.generateBlob((zipPct) => {
-            setProgress((prev) => ({ ...prev, zipPercent: zipPct }));
-          }, 'STORE');
-          const suffix = totalParts > 1 ? `_parte_${partIndex + 1}_de_${totalParts}` : '';
-          downloadBlob(blob, `shinobi_sprites_${contentMode}${suffix}.zip`);
-        } finally {
-          session.dispose();
         }
+
+        await persistJobProgress(true);
+        if (controller.signal.aborted) break;
+
+        const suffix = totalParts > 1 ? `_parte_${partIndex + 1}_de_${totalParts}` : '';
+        const filename = `shinobi_sprites_${activeMode}${suffix}.zip`;
+        await packageRangeToZip(
+          job,
+          partStart,
+          partEnd,
+          filename,
+          totalParts > 1 ? `parte ${partIndex + 1} de ${totalParts}` : undefined
+        );
+        setPackaging(false);
+        exportedPartsSet.add(partIndex);
+        await persistJobProgress(true);
       }
 
       if (controller.signal.aborted) {
-        setStatusMessage('Download em lote cancelado.');
-      } else {
+        job.status = 'paused';
+        await persistJobProgress(true);
+        const wasNet = pauseReasonRef.current === 'network' || !navigator.onLine;
+        setPausedByNetwork(wasNet);
         setStatusMessage(
-          `Concluído! ${done - errors} de ${targetList.length} ninjas exportados.`
+          wasNet
+            ? `Conexão instável ou offline. Progresso salvo em ${completedSet.size}/${activeList.length} ninjas — clique em "Continuar Download" quando a rede voltar.`
+            : `Download pausado em ${completedSet.size}/${activeList.length} ninjas. Você pode continuar de onde parou a qualquer momento.`
+        );
+      } else {
+        job.status = 'completed';
+        await persistJobProgress(true);
+        setStatusMessage(
+          `Concluído! ${completedSet.size} de ${activeList.length} ninjas empacotados (${formatBytesCompact(totalBytes)}).`
         );
       }
+    } catch (err) {
+      job.status = 'paused';
+      await persistJobProgress(true);
+      setStatusMessage(
+        err instanceof Error
+          ? `Interrompido: ${err.message}. Progresso salvo (${completedSet.size}/${activeList.length}).`
+          : `Download pausado com progresso salvo (${completedSet.size}/${activeList.length}).`
+      );
     } finally {
+      window.removeEventListener('offline', onOffline);
+      setPackaging(false);
       setRunning(false);
       abortRef.current = null;
     }
@@ -245,6 +642,11 @@ export function BatchZipModal({
       : progress.total > 0
       ? Math.round((progress.done / progress.total) * 100)
       : 0;
+
+  const hasResumablePausedJob =
+    !running && !packaging && savedJob && savedJob.status === 'paused';
+  const hasCompletedCachedJob =
+    !running && !packaging && savedJob && savedJob.status === 'completed';
 
   return (
     <div
@@ -260,12 +662,12 @@ export function BatchZipModal({
               {title}
             </h3>
             <p className="mt-1 text-xs text-slate-400 tabular-nums">
-              {ninjas.length} ninjas disponíveis · Compactação em segundo plano (Web Worker)
+              {ninjas.length} ninjas disponíveis · Cache local retomável (IndexedDB) + ZIP Streaming
             </p>
           </div>
           <button
             type="button"
-            disabled={running}
+            disabled={running || packaging}
             onClick={onClose}
             aria-label="Fechar janela"
             className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40 cursor-pointer"
@@ -273,6 +675,112 @@ export function BatchZipModal({
             <X className="h-4 w-4" aria-hidden="true" />
           </button>
         </div>
+
+        {/* Saved Paused Job Banner */}
+        {hasResumablePausedJob && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-950/25 p-3.5 space-y-3">
+            <div className="flex items-start justify-between gap-2">
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-200">
+                  {pausedByNetwork && <WifiOff className="h-3.5 w-3.5 shrink-0" />}
+                  <span>Download em pausa salvo localmente</span>
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  {MODE_LABELS[savedJob.contentMode]} · Ninjas {savedJob.startIdx}–{savedJob.endIdx}
+                </p>
+                <p className="text-[11px] font-mono text-amber-300 tabular-nums">
+                  {savedJob.completedIndices.length}/{savedJob.totalNinjas} ninjas salvos ·{' '}
+                  {formatBytesCompact(savedJob.totalBytes)} em cache
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleDiscardSaved()}
+                title="Descartar cache salvo"
+                className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0B0F17] px-2 py-1 text-[11px] text-slate-300 hover:border-red-500/60 hover:text-red-200 cursor-pointer"
+              >
+                <Trash2 className="h-3 w-3" />
+                <span>Descartar</span>
+              </button>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void runJob(savedJob)}
+                className="inline-flex items-center gap-1.5 rounded-md bg-orange-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-orange-500 cursor-pointer"
+              >
+                <Play className="h-3.5 w-3.5" />
+                <span>
+                  Continuar Download (faltam{' '}
+                  {Math.max(
+                    0,
+                    savedJob.totalNinjas -
+                      savedJob.completedIndices.length -
+                      savedJob.failedIndices.length
+                  )}
+                  )
+                </span>
+              </button>
+
+              {savedJob.completedIndices.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void handleReexportSaved(savedJob, 'parcial')}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-slate-500 cursor-pointer"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  <span>Gerar ZIP Parcial ({savedJob.completedIndices.length})</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Completed Cached Job Banner (Re-download or Direct Disk Save) */}
+        {hasCompletedCachedJob && (
+          <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/20 p-3.5 space-y-2.5">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold text-emerald-200">
+                  Pacote pronto no cache local
+                </div>
+                <p className="text-[11px] text-slate-300 tabular-nums">
+                  {MODE_LABELS[savedJob.contentMode]} · {savedJob.completedIndices.length} ninjas ·{' '}
+                  {formatBytesCompact(savedJob.totalBytes)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleDiscardSaved()}
+                className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#0B0F17] px-2 py-1 text-[11px] text-slate-300 hover:border-slate-500 cursor-pointer"
+              >
+                <Trash2 className="h-3 w-3" />
+                <span>Limpar Cache</span>
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void handleReexportSaved(savedJob)}
+                className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 cursor-pointer"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>Baixar ZIP Novamente</span>
+              </button>
+              {supportsSavePicker && (
+                <button
+                  type="button"
+                  onClick={() => void handleDirectSaveToDisk(savedJob)}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-slate-500 cursor-pointer"
+                >
+                  <HardDriveDownload className="h-3.5 w-3.5" />
+                  <span>Salvar Direto no Disco...</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Content Format Choice */}
         <div className="space-y-2">
@@ -308,7 +816,7 @@ export function BatchZipModal({
                 <input
                   type="radio"
                   name="batchMode"
-                  disabled={running}
+                  disabled={running || packaging}
                   checked={contentMode === opt.id}
                   onChange={() => setContentMode(opt.id)}
                   className="mt-0.5 accent-orange-500"
@@ -330,7 +838,7 @@ export function BatchZipModal({
               type="number"
               min={1}
               max={ninjas.length}
-              disabled={running}
+              disabled={running || packaging}
               value={startIdx}
               onChange={(e) => setStartIdx(Number(e.target.value))}
               className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-2.5 py-1.5 font-mono text-slate-100"
@@ -342,7 +850,7 @@ export function BatchZipModal({
               type="number"
               min={1}
               max={ninjas.length}
-              disabled={running}
+              disabled={running || packaging}
               value={endIdx}
               onChange={(e) => setEndIdx(Number(e.target.value))}
               className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-2.5 py-1.5 font-mono text-slate-100"
@@ -351,7 +859,7 @@ export function BatchZipModal({
           <label className="space-y-1">
             <span className="text-slate-400">Dividir ZIP</span>
             <select
-              disabled={running}
+              disabled={running || packaging}
               value={chunkSize}
               onChange={(e) => setChunkSize(Number(e.target.value))}
               className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-2 py-1.5 font-mono text-slate-100"
@@ -365,7 +873,7 @@ export function BatchZipModal({
           <label className="space-y-1">
             <span className="text-slate-400">Velocidade</span>
             <select
-              disabled={running}
+              disabled={running || packaging}
               value={concurrency}
               onChange={(e) => setConcurrency(Number(e.target.value))}
               className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-2 py-1.5 font-mono text-slate-100"
@@ -377,14 +885,14 @@ export function BatchZipModal({
           </label>
         </div>
 
-        {(running || statusMessage) && (
+        {(running || packaging || statusMessage) && (
           <div className="space-y-2 rounded-lg border border-slate-800 bg-[#0B0F17] p-3">
             <div className="flex items-center justify-between text-xs font-mono tabular-nums">
               <span className="text-slate-200 truncate">
                 {progress.zipPercent !== null
                   ? statusMessage || 'Empacotando ZIP...'
                   : running
-                  ? `Baixando (${progress.ratePerSec}/s): ${progress.currentId}...`
+                  ? `Baixando (${progress.ratePerSec}/s · ${formatBytesCompact(progress.savedBytes)}): ${progress.currentId}...`
                   : statusMessage}
               </span>
               <span className="text-orange-400 shrink-0 ml-2">
@@ -411,28 +919,35 @@ export function BatchZipModal({
           {running ? (
             <button
               type="button"
-              onClick={handleCancel}
-              className="rounded-lg border border-red-800 bg-red-950/40 px-4 py-2 text-xs font-semibold text-red-200 hover:bg-red-900/40 cursor-pointer"
+              disabled={packaging}
+              onClick={handlePause}
+              className="inline-flex items-center gap-2 rounded-lg border border-amber-700 bg-amber-950/50 px-4 py-2 text-xs font-semibold text-amber-200 hover:bg-amber-900/50 disabled:opacity-40 cursor-pointer"
             >
-              Cancelar
+              <Pause className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Pausar Download</span>
             </button>
           ) : (
             <>
               <button
                 type="button"
+                disabled={packaging}
                 onClick={onClose}
-                className="rounded-lg border border-slate-700 bg-[#0B0F17] px-4 py-2 text-xs font-medium text-slate-300 hover:border-slate-500 cursor-pointer"
+                className="rounded-lg border border-slate-700 bg-[#0B0F17] px-4 py-2 text-xs font-medium text-slate-300 hover:border-slate-500 disabled:opacity-40 cursor-pointer"
               >
                 Fechar
               </button>
               <button
                 type="button"
-                disabled={targetList.length === 0}
-                onClick={() => void handleStartDownload()}
+                disabled={targetList.length === 0 || packaging}
+                onClick={() => void runJob()}
                 className="inline-flex items-center gap-2 rounded-lg bg-orange-600 px-4 py-2 text-xs font-semibold text-white hover:bg-orange-500 disabled:opacity-40 cursor-pointer"
               >
                 <Download className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Baixar {targetList.length} Ninjas (ZIP)</span>
+                <span>
+                  {hasResumablePausedJob
+                    ? `Novo Download (${targetList.length})`
+                    : `Baixar ${targetList.length} Ninjas (ZIP)`}
+                </span>
               </button>
             </>
           )}

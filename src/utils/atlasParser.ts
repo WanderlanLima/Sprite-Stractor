@@ -1,3 +1,4 @@
+import { GIFEncoder, applyPalette, quantize } from 'gifenc';
 import type {
   AtlasPage,
   AtlasRegion,
@@ -851,7 +852,7 @@ export function downloadBlob(blob: Blob, filename: string) {
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function dataUrlToUint8Array(dataUrl: string): Uint8Array | null {
@@ -1004,3 +1005,151 @@ export function exportAnimationStripPng(
     cellHeight: cellH,
   };
 }
+
+export async function exportAnimationGif(
+  skeleton: SpineSkeleton,
+  animName: string,
+  regionCanvasMap: Map<string, HTMLCanvasElement>,
+  options?: {
+    fps?: number;
+    bounds?: AnimationWorldBounds | null;
+    backgroundColor?: string | null;
+    onProgress?: (percent: number) => void;
+  }
+): Promise<{ blob: Blob; frameCount: number; width: number; height: number }> {
+  const fps = options?.fps ?? 18;
+  const duration = getAnimationDuration(skeleton, animName);
+  const frameCount =
+    duration <= 0 ? 1 : Math.max(1, Math.min(72, Math.round(duration * fps)));
+  const delayMs = duration <= 0 ? 100 : Math.max(20, Math.round((duration / frameCount) * 1000));
+
+  const bounds =
+    options?.bounds || computeAnimationWorldBounds(skeleton, animName, regionCanvasMap, 24);
+  const cellW = Math.max(160, Math.min(512, Math.ceil(bounds.width * 1.16)));
+  const cellH = Math.max(160, Math.min(512, Math.ceil(bounds.height * 1.16)));
+
+  const frameCanvas = document.createElement('canvas');
+  frameCanvas.width = cellW;
+  frameCanvas.height = cellH;
+  const ctx = frameCanvas.getContext('2d', { willReadFrequently: true });
+  const bgColor = options?.backgroundColor || null;
+
+  const gif = GIFEncoder();
+
+  if (ctx) {
+    for (let i = 0; i < frameCount; i++) {
+      const t = frameCount === 1 ? 0 : (i / frameCount) * duration;
+      renderSpineFrameToCanvas(
+        ctx,
+        cellW,
+        cellH,
+        skeleton,
+        animName,
+        t,
+        regionCanvasMap,
+        1,
+        0,
+        0,
+        bounds
+      );
+
+      if (bgColor) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'destination-over';
+        ctx.fillStyle = bgColor;
+        ctx.fillRect(0, 0, cellW, cellH);
+        ctx.restore();
+      }
+
+      const imageData = ctx.getImageData(0, 0, cellW, cellH);
+      const rgba = imageData.data;
+
+      if (bgColor) {
+        const palette = quantize(rgba, 256, { format: 'rgb565' });
+        while (palette.length < 4) palette.push([0, 0, 0]);
+        const indexed = applyPalette(rgba, palette, 'rgb565');
+        const depth = Math.max(2, Math.ceil(Math.log2(palette.length)));
+        gif.writeFrame(indexed, cellW, cellH, {
+          palette,
+          delay: delayMs,
+          repeat: 0,
+          dispose: 0,
+          colorDepth: depth,
+          transparent: false,
+        });
+      } else {
+        // Extract only opaque pixels so transparent index 0 never collides with black outlines
+        const totalPixels = cellW * cellH;
+        const opaqueMask = new Uint8Array(totalPixels);
+        let opaqueCount = 0;
+        for (let px = 0, p = 0; px < totalPixels; px++, p += 4) {
+          if (rgba[p + 3] >= 64) {
+            opaqueMask[px] = 1;
+            opaqueCount++;
+          }
+        }
+
+        const opaqueRgba = new Uint8Array(Math.max(4, opaqueCount * 4));
+        if (opaqueCount === 0) {
+          opaqueRgba[0] = 0;
+          opaqueRgba[1] = 0;
+          opaqueRgba[2] = 0;
+          opaqueRgba[3] = 255;
+        } else {
+          let wIdx = 0;
+          for (let px = 0, p = 0; px < totalPixels; px++, p += 4) {
+            if (opaqueMask[px]) {
+              opaqueRgba[wIdx++] = rgba[p];
+              opaqueRgba[wIdx++] = rgba[p + 1];
+              opaqueRgba[wIdx++] = rgba[p + 2];
+              opaqueRgba[wIdx++] = 255;
+            }
+          }
+        }
+
+        const opaquePalette = quantize(opaqueRgba, 255, { format: 'rgb565' });
+        const finalPalette: Array<[number, number, number]> = [
+          [0, 0, 0], // Index 0 is strictly reserved as the transparent background index
+          ...opaquePalette.map(
+            (c) => [c[0], c[1], c[2]] as [number, number, number]
+          ),
+        ];
+        while (finalPalette.length < 4) finalPalette.push([0, 0, 0]);
+
+        const finalIndexed = new Uint8Array(totalPixels);
+        if (opaqueCount > 0) {
+          const opaqueIndexed = applyPalette(rgba, opaquePalette, 'rgb565');
+          for (let px = 0; px < totalPixels; px++) {
+            finalIndexed[px] = opaqueMask[px] ? opaqueIndexed[px] + 1 : 0;
+          }
+        }
+
+        const depth = Math.max(2, Math.ceil(Math.log2(finalPalette.length)));
+        gif.writeFrame(finalIndexed, cellW, cellH, {
+          palette: finalPalette,
+          delay: delayMs,
+          repeat: 0,
+          dispose: 2,
+          colorDepth: depth,
+          transparent: true,
+          transparentIndex: 0,
+        });
+      }
+
+      options?.onProgress?.(Math.round(((i + 1) / frameCount) * 100));
+      if (i % 3 === 2) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+    }
+  }
+
+  gif.finish();
+  const bytes = gif.bytes();
+  return {
+    blob: new Blob([bytes], { type: 'image/gif' }),
+    frameCount,
+    width: cellW,
+    height: cellH,
+  };
+}
+

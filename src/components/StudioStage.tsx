@@ -26,7 +26,9 @@ import type {
 } from '../types/sprite';
 import {
   computeAnimationWorldBounds,
+  downloadBlob,
   downloadDataUrl,
+  exportAnimationGif,
   exportAnimationStripPng,
   exportFramesAsZip,
   extractRegionToCanvas,
@@ -100,6 +102,8 @@ export function StudioStage({
   const [showAtlasBoxes, setShowAtlasBoxes] = useState(true);
   const [selectedRegion, setSelectedRegion] = useState<AtlasRegion | null>(null);
   const [exportingAnim, setExportingAnim] = useState(false);
+  const [gifProgress, setGifProgress] = useState<number | null>(null);
+  const [gifBg, setGifBg] = useState<'transparent' | 'dark' | 'light' | 'chroma'>('transparent');
 
   const playerCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const animTimeRef = useRef(0);
@@ -394,6 +398,31 @@ export function StudioStage({
       await exportFramesAsZip(`${ninja.id}_${selectedAnim}.zip`, animFrames);
     } finally {
       setExportingAnim(false);
+    }
+  };
+
+  const handleExportAnimGif = async () => {
+    if (!skeleton || !selectedAnim || !ninja) return;
+    setGifProgress(0);
+    const backgroundColor =
+      gifBg === 'dark'
+        ? '#090D14'
+        : gifBg === 'light'
+        ? '#F8FAFC'
+        : gifBg === 'chroma'
+        ? '#00B140'
+        : null;
+    try {
+      const res = await exportAnimationGif(skeleton, selectedAnim, regionCanvasMap, {
+        fps: 18,
+        bounds: animWorldBounds,
+        backgroundColor,
+        onProgress: (pct) => setGifProgress(pct),
+      });
+      const bgSuffix = gifBg === 'transparent' ? '_sem_fundo' : `_${gifBg}`;
+      downloadBlob(res.blob, `${ninja.id}_${selectedAnim}${bgSuffix}.gif`);
+    } finally {
+      setGifProgress(null);
     }
   };
 
@@ -755,9 +784,48 @@ export function StudioStage({
                       <Download className="h-3.5 w-3.5" aria-hidden="true" />
                       <span>Exportar Spritesheet ({selectedAnim})</span>
                     </button>
+                    <div className="inline-flex items-center overflow-hidden rounded-lg border border-emerald-500/40 bg-emerald-950/30">
+                      <select
+                        value={gifBg}
+                        disabled={exportingAnim || gifProgress !== null}
+                        onChange={(e) =>
+                          setGifBg(
+                            e.target.value as 'transparent' | 'dark' | 'light' | 'chroma'
+                          )
+                        }
+                        aria-label="Fundo do GIF"
+                        className="border-r border-emerald-500/30 bg-transparent px-2 py-1.5 text-xs text-emerald-100 focus:outline-none cursor-pointer disabled:opacity-50"
+                      >
+                        <option value="transparent" className="bg-[#0B0F17] text-slate-100">
+                          Sem fundo
+                        </option>
+                        <option value="dark" className="bg-[#0B0F17] text-slate-100">
+                          Fundo escuro
+                        </option>
+                        <option value="light" className="bg-[#0B0F17] text-slate-100">
+                          Fundo claro
+                        </option>
+                        <option value="chroma" className="bg-[#0B0F17] text-slate-100">
+                          Chroma verde
+                        </option>
+                      </select>
+                      <button
+                        type="button"
+                        disabled={exportingAnim || gifProgress !== null}
+                        onClick={() => void handleExportAnimGif()}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-50 cursor-pointer"
+                      >
+                        <Film className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>
+                          {gifProgress !== null
+                            ? `Gerando GIF (${gifProgress}%)...`
+                            : `Exportar GIF (${selectedAnim})`}
+                        </span>
+                      </button>
+                    </div>
                     <button
                       type="button"
-                      disabled={exportingAnim}
+                      disabled={exportingAnim || gifProgress !== null}
                       onClick={handleExportAnimZip}
                       className="inline-flex items-center gap-1.5 rounded-lg border border-orange-500/40 bg-orange-950/30 px-3 py-1.5 text-xs font-medium text-orange-200 hover:bg-orange-900/40 disabled:opacity-50 cursor-pointer"
                     >
