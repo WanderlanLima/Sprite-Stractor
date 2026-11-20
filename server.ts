@@ -853,12 +853,77 @@ async function createServer() {
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
+    const hmrDisabled =
+      process.env.DISABLE_HMR === 'true' || Boolean(process.env.K_SERVICE);
+
+    if (hmrDisabled) {
+      app.get('/@vite/client', (_req, res) => {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.send(`const sheetsMap = new Map();
+let lastInsertedStyle;
+
+export function updateStyle(id, content) {
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.setAttribute('data-vite-dev-id', id);
+    style.textContent = content;
+    if (!lastInsertedStyle) {
+      document.head.appendChild(style);
+      setTimeout(() => {
+        lastInsertedStyle = undefined;
+      }, 0);
+    } else {
+      lastInsertedStyle.insertAdjacentElement('afterend', style);
+    }
+    lastInsertedStyle = style;
+    sheetsMap.set(id, style);
+  } else if (style.textContent !== content) {
+    style.textContent = content;
+  }
+}
+
+export function removeStyle(id) {
+  const style = sheetsMap.get(id);
+  if (style) {
+    style.remove();
+    sheetsMap.delete(id);
+  }
+}
+
+export function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    acceptExports() {},
+    prune() {},
+    dispose() {},
+    decline() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+
+export function injectQuery(url) {
+  return url;
+}
+
+export class ErrorOverlay extends HTMLElement {}
+`);
+      });
+    }
+
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        ws: { server: httpServer },
-        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
-        watch: process.env.DISABLE_HMR === 'true' ? null : {},
+        allowedHosts: true,
+        ws: hmrDisabled ? false : { server: httpServer },
+        hmr: hmrDisabled ? false : { server: httpServer },
+        watch: hmrDisabled ? null : {},
       },
       appType: 'spa',
     });
