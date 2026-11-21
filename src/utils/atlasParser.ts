@@ -245,6 +245,19 @@ function getDefaultSkinAttachments(
   return skeleton.skins.default || Object.values(skeleton.skins)[0] || {};
 }
 
+export function hasVisibleAnimationContent(
+  skeleton: SpineSkeleton | null | undefined,
+  animName: string
+): boolean {
+  if (!skeleton || !animName) return false;
+  if ((skeleton.slots || []).some((s) => Boolean(s.attachment))) return true;
+  const anim = skeleton.animations?.[animName];
+  if (!anim?.slots) return false;
+  return Object.values(anim.slots).some((slotAnim) =>
+    (slotAnim.attachment || []).some((kf) => Boolean(kf.name))
+  );
+}
+
 export function getAnimationDuration(skeleton: SpineSkeleton, animName: string): number {
   const anim = skeleton.animations?.[animName];
   if (!anim) return 0;
@@ -256,6 +269,9 @@ export function getAnimationDuration(skeleton: SpineSkeleton, animName: string):
         if ((kf.time || 0) > maxTime) maxTime = kf.time || 0;
       }
       for (const kf of slotAnim.color || []) {
+        if ((kf.time || 0) > maxTime) maxTime = kf.time || 0;
+      }
+      for (const kf of slotAnim.twoColor || []) {
         if ((kf.time || 0) > maxTime) maxTime = kf.time || 0;
       }
     }
@@ -460,17 +476,15 @@ function parseHexAlpha(colorHex?: string): number {
   return Math.max(0, Math.min(1, alphaByte / 255));
 }
 
-function sampleSlotAlpha(
-  slot: SpineSlotDef,
-  anim: SpineAnimationData | undefined,
+function sampleHexAlphaTimeline<T extends { time?: number; curve?: unknown }>(
+  frames: T[] | undefined,
+  getHex: (frame: T) => string | undefined,
   time: number
-): number {
-  const baseAlpha = parseHexAlpha(slot.color);
-  const frames = anim?.slots?.[slot.name]?.color;
-  if (!frames || frames.length === 0) return baseAlpha;
+): number | null {
+  if (!frames || frames.length === 0) return null;
 
   const firstTime = frames[0].time || 0;
-  if (time <= firstTime) return parseHexAlpha(frames[0].color);
+  if (time <= firstTime) return parseHexAlpha(getHex(frames[0]));
 
   for (let i = 0; i < frames.length - 1; i++) {
     const a = frames[i];
@@ -478,14 +492,28 @@ function sampleSlotAlpha(
     const ta = a.time || 0;
     const tb = b.time || 0;
     if (time >= ta && time <= tb) {
-      const va = parseHexAlpha(a.color);
-      const vb = parseHexAlpha(b.color);
+      const va = parseHexAlpha(getHex(a));
+      const vb = parseHexAlpha(getHex(b));
       if (a.curve === 'stepped' || tb === ta) return va;
       const alpha = (time - ta) / (tb - ta);
       return va + (vb - va) * alpha;
     }
   }
-  return parseHexAlpha(frames[frames.length - 1].color);
+  return parseHexAlpha(getHex(frames[frames.length - 1]));
+}
+
+function sampleSlotAlpha(
+  slot: SpineSlotDef,
+  anim: SpineAnimationData | undefined,
+  time: number
+): number {
+  const baseAlpha = parseHexAlpha(slot.color);
+  const slotAnim = anim?.slots?.[slot.name];
+  const colorAlpha = sampleHexAlphaTimeline(slotAnim?.color, (f) => f.color, time);
+  if (colorAlpha !== null) return colorAlpha;
+  const twoColorAlpha = sampleHexAlphaTimeline(slotAnim?.twoColor, (f) => f.light, time);
+  if (twoColorAlpha !== null) return twoColorAlpha;
+  return baseAlpha;
 }
 
 export interface AnimationWorldBounds {
@@ -596,7 +624,13 @@ function accumulateSkeletonBoundsAtTime(
   animName: string,
   regionCanvasMap: Map<string, HTMLCanvasElement>,
   t: number,
-  boundsAcc: { minX: number; maxX: number; minY: number; maxY: number }
+  boundsAcc: { minX: number; maxX: number; minY: number; maxY: number },
+  filterOpts?: {
+    maxSlotSpan?: number;
+    anchorCenterX?: number;
+    anchorCenterY?: number;
+    maxAnchorDist?: number;
+  }
 ) {
   const anim = skeleton.animations?.[animName];
   const slotsDef = skeleton.slots || [];
@@ -633,14 +667,50 @@ function accumulateSkeletonBoundsAtTime(
       [hw, hh],
       [-hw, hh],
     ];
+    let qMinX = Infinity;
+    let qMaxX = -Infinity;
+    let qMinY = Infinity;
+    let qMaxY = -Infinity;
     for (const [cx, cy] of corners) {
       const wx = finalMat.a * cx + finalMat.c * cy + finalMat.tx;
       const wy = finalMat.b * cx + finalMat.d * cy + finalMat.ty;
-      if (wx < boundsAcc.minX) boundsAcc.minX = wx;
-      if (wx > boundsAcc.maxX) boundsAcc.maxX = wx;
-      if (wy < boundsAcc.minY) boundsAcc.minY = wy;
-      if (wy > boundsAcc.maxY) boundsAcc.maxY = wy;
+      if (!Number.isFinite(wx) || !Number.isFinite(wy)) {
+        qMinX = Infinity;
+        break;
+      }
+      if (wx < qMinX) qMinX = wx;
+      if (wx > qMaxX) qMaxX = wx;
+      if (wy < qMinY) qMinY = wy;
+      if (wy > qMaxY) qMaxY = wy;
     }
+    if (!Number.isFinite(qMinX)) continue;
+
+    if (filterOpts?.maxSlotSpan) {
+      const qw = qMaxX - qMinX;
+      const qh = qMaxY - qMinY;
+      if (qw > filterOpts.maxSlotSpan || qh > filterOpts.maxSlotSpan) {
+        continue;
+      }
+    }
+    if (
+      typeof filterOpts?.anchorCenterX === 'number' &&
+      typeof filterOpts?.anchorCenterY === 'number' &&
+      typeof filterOpts?.maxAnchorDist === 'number'
+    ) {
+      const qcx = (qMinX + qMaxX) / 2;
+      const qcy = (qMinY + qMaxY) / 2;
+      if (
+        Math.abs(qcx - filterOpts.anchorCenterX) > filterOpts.maxAnchorDist ||
+        Math.abs(qcy - filterOpts.anchorCenterY) > filterOpts.maxAnchorDist
+      ) {
+        continue;
+      }
+    }
+
+    if (qMinX < boundsAcc.minX) boundsAcc.minX = qMinX;
+    if (qMaxX > boundsAcc.maxX) boundsAcc.maxX = qMaxX;
+    if (qMinY < boundsAcc.minY) boundsAcc.minY = qMinY;
+    if (qMaxY > boundsAcc.maxY) boundsAcc.maxY = qMaxY;
   }
 }
 
@@ -662,7 +732,7 @@ export function computeCompositeAnimationWorldBounds(
 ): AnimationWorldBounds {
   const anim = skeleton.animations?.[animName];
   const baseDuration = getAnimationDuration(skeleton, animName);
-  const boundsAcc = {
+  const baseAcc = {
     minX: Infinity,
     maxX: -Infinity,
     minY: Infinity,
@@ -671,20 +741,73 @@ export function computeCompositeAnimationWorldBounds(
 
   const sampleTimes = collectSampleTimes(anim, baseDuration, samples);
   for (const t of sampleTimes) {
-    accumulateSkeletonBoundsAtTime(skeleton, animName, regionCanvasMap, t, boundsAcc);
+    accumulateSkeletonBoundsAtTime(skeleton, animName, regionCanvasMap, t, baseAcc, {
+      maxSlotSpan: 2400,
+    });
   }
 
-  for (const layer of compositeLayers) {
-    const layerAnim = layer.skeleton.animations?.[layer.animName];
-    const layerSampleTimes = collectSampleTimes(layerAnim, layer.duration, Math.min(samples, 16));
-    for (const lt of layerSampleTimes) {
-      accumulateSkeletonBoundsAtTime(
-        layer.skeleton,
-        layer.animName,
-        layer.regionCanvasMap,
-        lt,
-        boundsAcc
-      );
+  // Fallback without slot-span filter if all slots in a standalone effect were huge
+  if (!Number.isFinite(baseAcc.minX) || !Number.isFinite(baseAcc.minY)) {
+    for (const t of sampleTimes) {
+      accumulateSkeletonBoundsAtTime(skeleton, animName, regionCanvasMap, t, baseAcc);
+    }
+  }
+
+  const hasBaseBounds = Number.isFinite(baseAcc.minX) && Number.isFinite(baseAcc.minY);
+  const baseW = hasBaseBounds ? Math.max(40, baseAcc.maxX - baseAcc.minX) : 160;
+  const baseH = hasBaseBounds ? Math.max(40, baseAcc.maxY - baseAcc.minY) : 160;
+  const baseCenterX = hasBaseBounds ? (baseAcc.minX + baseAcc.maxX) / 2 : 0;
+  const baseCenterY = hasBaseBounds ? (baseAcc.minY + baseAcc.maxY) / 2 : 80;
+
+  const boundsAcc = { ...baseAcc };
+
+  if (compositeLayers.length > 0) {
+    const effectAcc = {
+      minX: Infinity,
+      maxX: -Infinity,
+      minY: Infinity,
+      maxY: -Infinity,
+    };
+    const maxSlotSpan = hasBaseBounds ? Math.max(850, Math.max(baseW, baseH) * 3.5) : 2400;
+    const maxAnchorDist = hasBaseBounds ? Math.max(900, Math.max(baseW, baseH) * 4) : undefined;
+
+    for (const layer of compositeLayers) {
+      const layerAnim = layer.skeleton.animations?.[layer.animName];
+      const layerSampleTimes = collectSampleTimes(layerAnim, layer.duration, Math.min(samples, 16));
+      for (const lt of layerSampleTimes) {
+        accumulateSkeletonBoundsAtTime(
+          layer.skeleton,
+          layer.animName,
+          layer.regionCanvasMap,
+          lt,
+          effectAcc,
+          {
+            maxSlotSpan,
+            anchorCenterX: hasBaseBounds ? baseCenterX : undefined,
+            anchorCenterY: hasBaseBounds ? baseCenterY : undefined,
+            maxAnchorDist,
+          }
+        );
+      }
+    }
+
+    if (Number.isFinite(effectAcc.minX) && Number.isFinite(effectAcc.minY)) {
+      if (hasBaseBounds) {
+        // Clamp how far particle layers can zoom out/shift camera away from the character
+        const padLeft = Math.max(240, baseW * 1.4);
+        const padRight = Math.max(240, baseW * 1.4);
+        const padBottom = Math.max(180, baseH * 1.1);
+        const padTop = Math.max(260, baseH * 1.4);
+        boundsAcc.minX = Math.min(boundsAcc.minX, Math.max(effectAcc.minX, baseAcc.minX - padLeft));
+        boundsAcc.maxX = Math.max(boundsAcc.maxX, Math.min(effectAcc.maxX, baseAcc.maxX + padRight));
+        boundsAcc.minY = Math.min(boundsAcc.minY, Math.max(effectAcc.minY, baseAcc.minY - padBottom));
+        boundsAcc.maxY = Math.max(boundsAcc.maxY, Math.min(effectAcc.maxY, baseAcc.maxY + padTop));
+      } else {
+        boundsAcc.minX = effectAcc.minX;
+        boundsAcc.maxX = effectAcc.maxX;
+        boundsAcc.minY = effectAcc.minY;
+        boundsAcc.maxY = effectAcc.maxY;
+      }
     }
   }
 

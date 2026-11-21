@@ -112,6 +112,7 @@ export interface SpineAnimationData {
     {
       attachment?: Array<{ time?: number; name?: string | null }>;
       color?: Array<{ time?: number; color?: string; curve?: unknown }>;
+      twoColor?: Array<{ time?: number; light?: string; dark?: string; curve?: unknown }>;
     }
   >;
   bones?: Record<

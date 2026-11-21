@@ -166,9 +166,12 @@ export function buildCharacterInstructionsJson(
       for (const ref of filteredRefs) {
         const eff = effectBundles.get(ref.spineId);
         if (!eff) continue;
-        const effAnimName = eff.skeleton.animations?.[ref.animName]
-          ? ref.animName
-          : Object.keys(eff.skeleton.animations || {})[0];
+        const availAnims = Object.keys(eff.skeleton.animations || {});
+        const targetLower = ref.animName.trim().toLowerCase();
+        const effAnimName =
+          (eff.skeleton.animations?.[ref.animName] ? ref.animName : undefined) ||
+          availAnims.find((a) => a.trim().toLowerCase() === targetLower) ||
+          availAnims[0];
         if (!effAnimName) continue;
         layers.push({
           spineId: ref.spineId,
@@ -501,9 +504,12 @@ export async function collectCharacterCompleteFiles(
       for (const ref of refs) {
         const eff = effectBundles.get(ref.spineId);
         if (!eff) continue;
-        const effAnimName = eff.skeleton.animations?.[ref.animName]
-          ? ref.animName
-          : Object.keys(eff.skeleton.animations || {})[0];
+        const availAnims = Object.keys(eff.skeleton.animations || {});
+        const targetLower = ref.animName.trim().toLowerCase();
+        const effAnimName =
+          (eff.skeleton.animations?.[ref.animName] ? ref.animName : undefined) ||
+          availAnims.find((a) => a.trim().toLowerCase() === targetLower) ||
+          availAnims[0];
         if (!effAnimName) continue;
         layers.push({
           spineId: ref.spineId,

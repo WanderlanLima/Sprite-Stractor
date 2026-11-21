@@ -38,6 +38,7 @@ import {
   extractSpineEffectRefs,
   getAnimationDuration,
   getCompositeAnimationDuration,
+  hasVisibleAnimationContent,
   loadImageElement,
   parseAtlas,
   renderSpineFrameToCanvas,
@@ -57,6 +58,15 @@ interface LoadedEffectBundle {
 }
 
 const effectBundleCache = new Map<string, Promise<LoadedEffectBundle | null>>();
+
+async function loadEffectImageWithRetry(src: string): Promise<HTMLImageElement> {
+  try {
+    return await loadImageElement(src);
+  } catch {
+    await new Promise((r) => setTimeout(r, 350));
+    return await loadImageElement(src);
+  }
+}
 
 function loadEffectBundle(baseAtlasUrl: string, spineId: string): Promise<LoadedEffectBundle | null> {
   let atlasUrl: string;
@@ -78,9 +88,9 @@ function loadEffectBundle(baseAtlasUrl: string, spineId: string): Promise<Loaded
       if (!data.skeleton) return null;
       const parsedPages = parseAtlas(data.atlasText);
       const loadedImgs: Record<string, HTMLImageElement> = {};
-      await Promise.all(
+      await Promise.allSettled(
         Object.entries(data.pageUrls).map(async ([pageName, proxyUrl]) => {
-          loadedImgs[pageName] = await loadImageElement(proxyUrl);
+          loadedImgs[pageName] = await loadEffectImageWithRetry(proxyUrl);
         })
       );
       const canvasMap = new Map<string, HTMLCanvasElement>();
@@ -90,6 +100,10 @@ function loadEffectBundle(baseAtlasUrl: string, spineId: string): Promise<Loaded
         for (const reg of page.regions) {
           canvasMap.set(reg.name, extractRegionToCanvas(reg, img));
         }
+      }
+      if (canvasMap.size === 0) {
+        effectBundleCache.delete(cacheKey);
+        return null;
       }
       return {
         skeleton: data.skeleton,
@@ -193,6 +207,7 @@ export function StudioStage({
   const [effectMode, setEffectMode] = useState<'powers' | 'all' | 'base'>('powers');
   const [compositeLayers, setCompositeLayers] = useState<CompositeSpineLayer[]>([]);
   const [loadingEffects, setLoadingEffects] = useState(false);
+  const [effectLoadError, setEffectLoadError] = useState<string | null>(null);
 
   const [playerDetached, setPlayerDetached] = useState(false);
   const [dockHeight, setDockHeight] = useState(0);
@@ -268,7 +283,18 @@ export function StudioStage({
 
         const availableAnims = Object.keys(data.skeleton?.animations || {});
         const idleAnim = availableAnims.find((a) => a.toLowerCase() === 'idle');
+        const visibleIdle =
+          idleAnim && hasVisibleAnimationContent(data.skeleton, idleAnim) ? idleAnim : undefined;
+        const firstVisiblePriority = PRIORITY_ANIM_ORDER.find(
+          (a) => availableAnims.includes(a) && hasVisibleAnimationContent(data.skeleton, a)
+        );
+        const firstVisibleAny = availableAnims.find((a) =>
+          hasVisibleAnimationContent(data.skeleton, a)
+        );
         const defaultAnim =
+          visibleIdle ||
+          firstVisiblePriority ||
+          firstVisibleAny ||
           idleAnim ||
           PRIORITY_ANIM_ORDER.find((a) => availableAnims.includes(a)) ||
           availableAnims[0] ||
@@ -404,6 +430,7 @@ export function StudioStage({
     if (!ninja || !skeleton || !selectedAnim || effectMode === 'base' || rawEffectRefs.length === 0) {
       setCompositeLayers([]);
       setLoadingEffects(false);
+      setEffectLoadError(null);
       return;
     }
 
@@ -415,11 +442,14 @@ export function StudioStage({
     if (activeRefs.length === 0) {
       setCompositeLayers([]);
       setLoadingEffects(false);
+      setEffectLoadError(null);
       return;
     }
 
     let cancelled = false;
+    setCompositeLayers([]);
     setLoadingEffects(true);
+    setEffectLoadError(null);
 
     const uniqueSpineIds = Array.from(new Set(activeRefs.map((r) => r.spineId)));
     Promise.all(
@@ -437,9 +467,10 @@ export function StudioStage({
           const bundle = bundleMap.get(ref.spineId);
           if (!bundle) continue;
           const available = Object.keys(bundle.skeleton.animations || {});
+          const refLower = ref.animName.trim().toLowerCase();
           const targetAnim =
             available.find((a) => a === ref.animName) ||
-            available.find((a) => a.toLowerCase() === ref.animName.toLowerCase()) ||
+            available.find((a) => a.trim().toLowerCase() === refLower) ||
             available[0];
           if (!targetAnim) continue;
 
@@ -455,6 +486,9 @@ export function StudioStage({
           });
         }
         setCompositeLayers(builtLayers);
+        if (builtLayers.length === 0) {
+          setEffectLoadError('Partículas indisponíveis no momento');
+        }
       })
       .finally(() => {
         if (!cancelled) setLoadingEffects(false);
@@ -1063,6 +1097,11 @@ export function StudioStage({
                         {loadingEffects && (
                           <span className="text-xs text-orange-300 font-mono whitespace-nowrap">
                             Carregando poderes...
+                          </span>
+                        )}
+                        {!loadingEffects && effectLoadError && (
+                          <span className="text-xs text-amber-300 font-mono whitespace-nowrap">
+                            {effectLoadError}
                           </span>
                         )}
                       </div>
