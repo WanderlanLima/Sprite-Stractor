@@ -1,10 +1,13 @@
 import express from 'express';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
+import fs from 'node:fs/promises';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -441,6 +444,207 @@ function cropImageBufferWithConvert(
 
 const thumbMemoryCache = new Map<string, Buffer>();
 
+interface EnrichedCharacterMeta {
+  name?: string;
+  nameArtUrl?: string;
+}
+
+let cachedMetaPromise: Promise<Map<string, EnrichedCharacterMeta>> | null = null;
+let cachedMetaTimestamp = 0;
+
+const JOTA_DD = [
+  0xeb, 0x14, 0x79, 0xb3, 0xa9, 0xd6, 0x0c, 0x6e, 0x2d, 0x7c, 0x0f, 0x45, 0xc3, 0x45, 0x8f, 0x0d,
+  0xcc, 0x7f, 0x81, 0x52, 0xfa, 0xb1, 0x4b, 0xc1, 0x7c, 0x49, 0x5b, 0x52, 0x69, 0x3b, 0xfd, 0x96,
+];
+const JOTA_CD = [
+  0x5c, 0x16, 0x0c, 0x5a, 0x22, 0x5e, 0xb5, 0xd2, 0xb4, 0xc6, 0xca, 0xef, 0xbe, 0xbf, 0xde, 0xc2,
+  0x95, 0xc0, 0x60, 0xac, 0xf0, 0x7a, 0xd6, 0x64, 0x48, 0x23, 0xec, 0xa8, 0xdb, 0xa0, 0x14, 0xaf,
+];
+
+async function buildStaticCatalogMetaFallback(): Promise<Map<string, EnrichedCharacterMeta>> {
+  const map = new Map<string, EnrichedCharacterMeta>();
+  try {
+    const raw = await fs.readFile(path.join(__dirname, 'public', 'data', 'naruto-catalog.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      ninjas?: Array<{ id: string; name?: string; nameArtUrl?: string }>;
+    };
+    for (const n of parsed.ninjas || []) {
+      if (n.name || n.nameArtUrl) {
+        map.set(n.id, { name: n.name, nameArtUrl: n.nameArtUrl });
+      }
+    }
+  } catch {
+    // ignore missing static catalog
+  }
+  return map;
+}
+
+async function fetchJotaCharacterMetaMap(
+  activeOrigin: string,
+  activeHtml: string,
+  ninjas: Array<{ id: string; code: string }>
+): Promise<Map<string, EnrichedCharacterMeta>> {
+  if (!activeOrigin.includes('jotagame.com')) {
+    return new Map();
+  }
+
+  const now = Date.now();
+  if (cachedMetaPromise && now - cachedMetaTimestamp < 30 * 60 * 1000) {
+    return cachedMetaPromise;
+  }
+
+  cachedMetaTimestamp = now;
+  cachedMetaPromise = (async () => {
+    const fallbackMap = await buildStaticCatalogMetaFallback();
+    try {
+      const recMatch = activeHtml.match(
+        /window\.__VDF_RECURSOS__\s*=\s*\{[^}]*"manifesto"\s*:\s*"([^"]+)"/
+      );
+      const manifestoRel = recMatch?.[1];
+      if (!manifestoRel) return fallbackMap;
+
+      const manifestoUrl = new URL(manifestoRel, activeOrigin).toString();
+      const manResp = await fetchWithTimeout(manifestoUrl, 8000, 'application/json');
+      if (!manResp.ok) return fallbackMap;
+      const man = (await manResp.json()) as {
+        dadosVersao?: string;
+        arquivos?: Record<string, { url: string }>;
+      };
+      const fileSet = new Set(Object.values(man.arquivos || {}).map((e) => e.url));
+      const v = man.dadosVersao || '0';
+
+      const master = Buffer.from(JOTA_DD.map((val, i) => val ^ JOTA_CD[i]));
+      const nomeKey = crypto.createHmac('sha256', master).update('nome').digest();
+      const dadosKey = crypto.createHmac('sha256', master).update('dados').digest();
+
+      const fetchDados = async (pathStr: string): Promise<Record<string, unknown>> => {
+        const slug = crypto
+          .createHmac('sha256', nomeKey)
+          .update(pathStr)
+          .digest()
+          .subarray(0, 16)
+          .toString('base64')
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/, '');
+        const resp = await fetchWithTimeout(`${activeOrigin}/d/${slug}?v=${v}`, 8000, '*/*');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const buf = Buffer.from(await resp.arrayBuffer());
+        const decipher = crypto.createDecipheriv('aes-256-gcm', dadosKey, buf.subarray(0, 12));
+        decipher.setAuthTag(buf.subarray(buf.length - 16));
+        const dec = Buffer.concat([
+          decipher.update(buf.subarray(12, buf.length - 16)),
+          decipher.final(),
+        ]);
+        return JSON.parse(zlib.gunzipSync(dec).toString('utf8')) as Record<string, unknown>;
+      };
+
+      const [herois, pt, roleModels, skins] = await Promise.all([
+        fetchDados('dados/jogo/herois.json'),
+        fetchDados('dados/jogo/pt.json'),
+        fetchDados('dados/tabelas/json/RoleModel.json'),
+        fetchDados('dados/tabelas/json/SkinConfig.json'),
+      ]);
+
+      const resolvePt = (link: unknown): string | undefined => {
+        if (!link) return undefined;
+        const key = String(link).replace(/^Translate\.Id:/, '');
+        const val = pt[key];
+        if (!val) return undefined;
+        const resolved = Array.isArray(val) ? String(val[0] || '') : String(val);
+        return resolved.trim() || undefined;
+      };
+
+      type RoleModelObj = Record<string, unknown>;
+      const byTag = new Map<string, RoleModelObj>();
+      for (const rmVal of Object.values(roleModels)) {
+        if (!rmVal || typeof rmVal !== 'object') continue;
+        const rm = rmVal as RoleModelObj;
+        for (const k of [rm.Tag, rm.Animation, rm.SpineAnim]) {
+          if (typeof k === 'string' && k) {
+            const kl = k.toLowerCase();
+            if (!byTag.has(kl)) byTag.set(kl, rm);
+          }
+        }
+      }
+
+      const skinByModel = new Map<string, RoleModelObj>();
+      for (const skVal of Object.values(skins)) {
+        if (!skVal || typeof skVal !== 'object') continue;
+        const sk = skVal as RoleModelObj;
+        if (sk.roleModel != null) {
+          skinByModel.set(String(sk.roleModel), sk);
+        }
+      }
+
+      const pickExistingAsset = (candidates: Array<unknown>): string | undefined => {
+        for (const rel of candidates) {
+          if (typeof rel !== 'string' || !rel) continue;
+          const clean = rel.replace(/^\/+/, '');
+          const ptBase = clean.startsWith('acervo/') ? clean : `acervo/language/pt/${clean}`;
+          const ptWebp = ptBase.replace(/\.png$/i, '.webp');
+          if (fileSet.has(ptWebp)) return `${activeOrigin}/${ptWebp}`;
+          if (fileSet.has(ptBase)) return `${activeOrigin}/${ptBase}`;
+        }
+        return undefined;
+      };
+
+      const map = new Map<string, EnrichedCharacterMeta>(fallbackMap);
+      for (const n of ninjas) {
+        const idLow = n.id.toLowerCase();
+        const code6 = n.code.length === 8 && n.code.startsWith('100') ? n.code.slice(0, 6) : n.code;
+        const rm =
+          byTag.get(idLow) ||
+          (roleModels[n.code] as RoleModelObj | undefined) ||
+          (roleModels[code6] as RoleModelObj | undefined);
+        const modelCode = rm?.model != null ? String(rm.model) : code6;
+
+        let name =
+          (rm && resolvePt(rm.__link_name)) ||
+          (rm?.model != null
+            ? resolvePt((roleModels[String(rm.model)] as RoleModelObj | undefined)?.__link_name) ||
+              resolvePt(`HeroBase_${rm.model}_name`)
+            : undefined) ||
+          resolvePt((herois[n.code] as RoleModelObj | undefined)?.__link_name) ||
+          resolvePt(`HeroBase_${n.code}_name`) ||
+          resolvePt(`HeroBase_${code6}_name`);
+
+        const sk = skinByModel.get(String(rm?.Id ?? n.code));
+        if (sk) {
+          const skName = resolvePt(sk.__link_name);
+          if (skName && name && !name.includes(skName)) {
+            name = `${name} [${skName}]`;
+          } else if (skName && !name) {
+            name = skName;
+          }
+        }
+
+        const nameArtUrl = pickExistingAsset([
+          rm?.NamePic,
+          `asset/heros/${n.code}/namepic_${n.code}.png`,
+          `asset/heros/${modelCode}/namepic_${modelCode}.png`,
+          rm?.NewnamePic,
+          `asset/heros/Newname/newnamepic_${n.code}.png`,
+          `asset/heros/Newname/newnamepic_${modelCode}.png`,
+        ]);
+
+        if (name || nameArtUrl) {
+          map.set(n.id, {
+            name: name || fallbackMap.get(n.id)?.name,
+            nameArtUrl: nameArtUrl || fallbackMap.get(n.id)?.nameArtUrl,
+          });
+        }
+      }
+
+      return map;
+    } catch {
+      return fallbackMap;
+    }
+  })();
+
+  return cachedMetaPromise;
+}
+
 async function createServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
@@ -723,9 +927,21 @@ async function createServer() {
         })
       );
 
-      const uniqueNinjas = Array.from(ninjaMap.values()).sort((a, b) =>
+      const uniqueNinjasRaw = Array.from(ninjaMap.values()).sort((a, b) =>
         a.id.localeCompare(b.id, undefined, { numeric: true })
       );
+
+      const metaMap = await fetchJotaCharacterMetaMap(activeOrigin, activeHtml, uniqueNinjasRaw);
+      const uniqueNinjas = uniqueNinjasRaw.map((n) => {
+        const meta = metaMap.get(n.id);
+        return meta
+          ? {
+              ...n,
+              ...(meta.name ? { name: meta.name } : {}),
+              ...(meta.nameArtUrl ? { nameArtUrl: meta.nameArtUrl } : {}),
+            }
+          : n;
+      });
 
       const uniqueSheets = Array.from(new Map(sheets.map((s) => [s.url, s])).values()).sort((a, b) =>
         a.name.localeCompare(b.name, undefined, { numeric: true })

@@ -3,6 +3,8 @@ export type SpinePackageKind = 'character' | 'summon_skin' | 'effect';
 export interface NinjaEntry {
   id: string;
   code: string;
+  name?: string;
+  nameArtUrl?: string;
   width: number;
   height: number;
   offsetX: number;

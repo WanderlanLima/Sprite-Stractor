@@ -5,12 +5,23 @@ import { extractRegionToCanvas, loadImageElement, parseAtlas } from '../utils/at
 import {
   fetchNinjaBundle,
   getNinjaThumbUrl,
+  resolveAssetFetchUrl,
   resolveStaticNinjaThumbUrl,
 } from '../utils/remoteClient';
 
 interface NinjaCatalogProps {
   ninjas: NinjaEntry[];
   selectedNinjaId: string | null;
+  search: string;
+  onSearchChange: (val: string) => void;
+  kindFilter: 'character' | 'summon_skin' | 'effect' | 'all';
+  onKindFilterChange: (kind: 'character' | 'summon_skin' | 'effect' | 'all') => void;
+  sortBy: 'id' | 'name' | 'largest' | 'smallest';
+  onSortByChange: (sort: 'id' | 'name' | 'largest' | 'smallest') => void;
+  autoThumbnails: boolean;
+  onAutoThumbnailsChange: (val: boolean) => void;
+  page: number;
+  onPageChange: (page: number) => void;
   onSelectNinja: (ninja: NinjaEntry) => void;
   onGoToExtractor: () => void;
   onOpenBatchZip: (list: NinjaEntry[]) => void;
@@ -223,6 +234,11 @@ function NinjaCard({
     () => thumbnailCache.get(ninja.id) || directThumbUrl
   );
   const [loadingThumb, setLoadingThumb] = useState(false);
+  const [nameArtFailed, setNameArtFailed] = useState(false);
+
+  useEffect(() => {
+    setNameArtFailed(false);
+  }, [ninja.nameArtUrl]);
 
   useEffect(() => {
     const cached = thumbnailCache.get(ninja.id);
@@ -276,6 +292,9 @@ function NinjaCard({
   }, [ninja, autoThumbnails, directThumbUrl]);
 
   const kind = getSpineKind(ninja);
+  const resolvedNameArt =
+    ninja.nameArtUrl && !nameArtFailed ? resolveAssetFetchUrl(ninja.nameArtUrl) : null;
+  const displayName = ninja.name || ninja.id;
 
   return (
     <button
@@ -288,11 +307,15 @@ function NinjaCard({
           : 'border-slate-800/80 bg-[#131A26] hover:border-slate-600'
       }`}
     >
-      <div className="sprite-checkerboard relative flex h-36 w-full items-center justify-center overflow-hidden border-b border-slate-800/80 p-3">
+      <div
+        className={`sprite-checkerboard relative flex h-40 sm:h-44 w-full items-center justify-center overflow-hidden border-b border-slate-800/80 px-2.5 pt-2.5 ${
+          resolvedNameArt ? 'pb-11' : 'pb-2.5'
+        }`}
+      >
         {thumbUrl ? (
           <NinjaThumbCanvas
             src={thumbUrl}
-            alt={`Sprite ${ninja.id}`}
+            alt={`Sprite ${displayName}`}
             onError={() => {
               // If fast remote crop fails, fall back once to full-atlas canvas extraction
               if (!thumbUrl.startsWith('data:')) {
@@ -312,19 +335,40 @@ function NinjaCard({
             </span>
           </div>
         )}
+
+        {resolvedNameArt && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-center bg-gradient-to-t from-[#0B0F17]/80 via-[#0B0F17]/25 to-transparent px-1.5 pt-2 pb-1">
+            <img
+              src={resolvedNameArt}
+              alt={displayName}
+              loading="lazy"
+              referrerPolicy="no-referrer"
+              onError={() => setNameArtFailed(true)}
+              className="max-h-10 w-full object-contain drop-shadow-[0_2px_4px_rgba(0,0,0,0.85)]"
+            />
+          </div>
+        )}
       </div>
 
-      <div className="flex flex-col gap-1 p-3">
-        <div className="flex items-center justify-between gap-2">
-          <span className="truncate font-mono text-sm font-semibold text-slate-100" title={ninja.id}>
-            {ninja.id}
+      <div className="flex flex-col gap-1 p-2.5 sm:p-3">
+        <div className="flex items-start justify-between gap-1.5">
+          <span
+            className="line-clamp-1 font-display text-xs sm:text-sm font-semibold text-slate-100"
+            title={displayName}
+          >
+            {displayName}
           </span>
           <Eye
-            className="h-3.5 w-3.5 shrink-0 text-slate-500 transition-colors group-hover:text-orange-400"
+            className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-500 transition-colors group-hover:text-orange-400"
             aria-hidden="true"
           />
         </div>
-        <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono tabular-nums truncate">
+        {ninja.name && (
+          <div className="truncate font-mono text-[11px] text-orange-300/90" title={ninja.id}>
+            {ninja.id}
+          </div>
+        )}
+        <div className="flex items-center gap-1.5 text-[11px] sm:text-xs text-slate-400 font-mono tabular-nums truncate">
           <span>
             {ninja.width} × {ninja.height} px
           </span>
@@ -339,16 +383,20 @@ function NinjaCard({
 export function NinjaCatalog({
   ninjas,
   selectedNinjaId,
+  search,
+  onSearchChange,
+  kindFilter,
+  onKindFilterChange,
+  sortBy,
+  onSortByChange,
+  autoThumbnails,
+  onAutoThumbnailsChange,
+  page,
+  onPageChange,
   onSelectNinja,
   onGoToExtractor,
   onOpenBatchZip,
 }: NinjaCatalogProps) {
-  const [search, setSearch] = useState('');
-  const [kindFilter, setKindFilter] = useState<'character' | 'summon_skin' | 'effect' | 'all'>('character');
-  const [sortBy, setSortBy] = useState<'id' | 'largest' | 'smallest'>('id');
-  const [autoThumbnails, setAutoThumbnails] = useState(true);
-  const [page, setPage] = useState(1);
-
   const counts = useMemo(() => {
     let character = 0;
     let summon_skin = 0;
@@ -366,7 +414,12 @@ export function NinjaCatalog({
     const q = search.trim().toLowerCase();
     const list = ninjas.filter((n) => {
       if (kindFilter !== 'all' && getSpineKind(n) !== kindFilter) return false;
-      if (q && !n.id.toLowerCase().includes(q) && !n.code.toLowerCase().includes(q)) {
+      if (
+        q &&
+        !n.id.toLowerCase().includes(q) &&
+        !n.code.toLowerCase().includes(q) &&
+        !(n.name || '').toLowerCase().includes(q)
+      ) {
         return false;
       }
       return true;
@@ -376,6 +429,10 @@ export function NinjaCatalog({
       list.sort((a, b) => b.width * b.height - a.width * a.height);
     } else if (sortBy === 'smallest') {
       list.sort((a, b) => a.width * a.height - b.width * b.height);
+    } else if (sortBy === 'name') {
+      list.sort((a, b) =>
+        (a.name || a.id).localeCompare(b.name || b.id, 'pt-BR', { numeric: true })
+      );
     } else {
       list.sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
     }
@@ -389,13 +446,9 @@ export function NinjaCatalog({
     return filtered.slice(start, start + PAGE_SIZE);
   }, [filtered, safePage]);
 
-  useEffect(() => {
-    setPage(1);
-  }, [search, sortBy, kindFilter]);
-
   if (ninjas.length === 0) {
     return (
-      <div className="mx-auto max-w-2xl rounded-lg border border-slate-800 bg-[#131A26] p-10 text-center">
+      <div className="mx-auto max-w-2xl rounded-lg border border-slate-800 bg-[#131A26] p-6 sm:p-10 text-center">
         <h2 className="font-display text-lg font-semibold text-slate-100">
           Nenhum pacote Spine carregado
         </h2>
@@ -414,11 +467,11 @@ export function NinjaCatalog({
   }
 
   return (
-    <section className="space-y-5">
-      <div className="flex flex-col gap-4 border-b border-slate-800/80 pb-4">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+    <section className="space-y-4 sm:space-y-5">
+      <div className="flex flex-col gap-3 sm:gap-4 border-b border-slate-800/80 pb-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div>
-            <h2 className="font-display text-xl font-semibold text-slate-50">
+            <h2 className="font-display text-lg sm:text-xl font-semibold text-slate-50">
               Catálogo Spine (Ninjas, Invocações e Efeitos)
             </h2>
             <p className="mt-0.5 text-xs text-slate-400 tabular-nums">
@@ -426,8 +479,8 @@ export function NinjaCatalog({
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative min-w-[230px] flex-1 sm:flex-initial">
+          <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
+            <div className="relative w-full min-w-0 sm:w-64">
               <Search
                 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500"
                 aria-hidden="true"
@@ -435,20 +488,23 @@ export function NinjaCatalog({
               <input
                 type="search"
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Buscar ID ou nome (ex: Wanshe, 100301)..."
-                aria-label="Filtrar pacotes Spine por ID ou nome"
+                onChange={(e) => onSearchChange(e.target.value)}
+                placeholder="Buscar nome ou ID (ex: Tsunade, Naruto, 100301)..."
+                aria-label="Filtrar pacotes Spine por nome ou ID"
                 className="w-full rounded-lg border border-slate-800 bg-[#131A26] py-2 pl-9 pr-3 text-sm text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
               />
             </div>
 
             <select
               value={sortBy}
-              onChange={(e) => setSortBy(e.target.value as 'id' | 'largest' | 'smallest')}
+              onChange={(e) =>
+                onSortByChange(e.target.value as 'id' | 'name' | 'largest' | 'smallest')
+              }
               aria-label="Ordenar pacotes"
-              className="rounded-lg border border-slate-800 bg-[#131A26] px-3 py-2 text-sm text-slate-200 focus:border-orange-500 focus:outline-none cursor-pointer"
+              className="w-full sm:w-auto rounded-lg border border-slate-800 bg-[#131A26] px-3 py-2 text-xs sm:text-sm text-slate-200 focus:border-orange-500 focus:outline-none cursor-pointer"
             >
-              <option value="id">Ordenar: ID / Nome</option>
+              <option value="id">Ordenar: ID</option>
+              <option value="name">Ordenar: Nome (A–Z)</option>
               <option value="largest">Ordenar: Maior dimensão</option>
               <option value="smallest">Ordenar: Menor dimensão</option>
             </select>
@@ -457,7 +513,7 @@ export function NinjaCatalog({
               <input
                 type="checkbox"
                 checked={autoThumbnails}
-                onChange={(e) => setAutoThumbnails(e.target.checked)}
+                onChange={(e) => onAutoThumbnailsChange(e.target.checked)}
                 className="h-3.5 w-3.5 accent-orange-500"
               />
               <span className="whitespace-nowrap">Miniaturas automáticas</span>
@@ -467,7 +523,7 @@ export function NinjaCatalog({
               type="button"
               disabled={filtered.length === 0}
               onClick={() => onOpenBatchZip(filtered)}
-              className="inline-flex items-center gap-2 rounded-lg bg-orange-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-orange-500 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
+              className="inline-flex flex-1 sm:flex-initial items-center justify-center gap-2 rounded-lg bg-orange-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-orange-500 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
             >
               <Download className="h-3.5 w-3.5" aria-hidden="true" />
               <span>Baixar Todos ({filtered.length}) ZIP</span>
@@ -475,7 +531,7 @@ export function NinjaCatalog({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] p-1 w-fit">
+        <div className="flex w-full sm:w-fit items-center gap-1 overflow-x-auto rounded-lg border border-slate-800 bg-[#131A26] p-1">
           {(
             [
               { id: 'character', label: 'Ninjas', count: counts.character },
@@ -487,7 +543,7 @@ export function NinjaCatalog({
             <button
               key={tab.id}
               type="button"
-              onClick={() => setKindFilter(tab.id)}
+              onClick={() => onKindFilterChange(tab.id)}
               aria-pressed={kindFilter === tab.id}
               className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
                 kindFilter === tab.id
@@ -506,7 +562,7 @@ export function NinjaCatalog({
           Nenhum pacote encontrado para "{search}".
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+        <div className="grid grid-cols-2 gap-2.5 sm:gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
           {pageItems.map((ninja) => (
             <NinjaCard
               key={ninja.id}
@@ -520,7 +576,7 @@ export function NinjaCatalog({
       )}
 
       {totalPages > 1 && (
-        <div className="flex items-center justify-between border-t border-slate-800/80 pt-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 pt-4">
           <span className="text-xs text-slate-400 font-mono tabular-nums">
             Página {safePage} de {totalPages}
           </span>
@@ -528,7 +584,7 @@ export function NinjaCatalog({
             <button
               type="button"
               disabled={safePage <= 1}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              onClick={() => onPageChange(Math.max(1, safePage - 1))}
               className="inline-flex items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-slate-600 disabled:opacity-40 cursor-pointer"
             >
               <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
@@ -537,7 +593,7 @@ export function NinjaCatalog({
             <button
               type="button"
               disabled={safePage >= totalPages}
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              onClick={() => onPageChange(Math.min(totalPages, safePage + 1))}
               className="inline-flex items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-slate-600 disabled:opacity-40 cursor-pointer"
             >
               <span>Próxima</span>

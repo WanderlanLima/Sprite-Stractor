@@ -64,6 +64,15 @@ export default function App() {
   const [corsProxyInput, setCorsProxyInput] = useState(() => getSavedCorsProxy());
   const [proxySavedNotice, setProxySavedNotice] = useState(false);
 
+  // Persisted NinjaCatalog state so returning from Studio stays on the exact page & filters
+  const [catalogSearch, setCatalogSearch] = useState('');
+  const [catalogKindFilter, setCatalogKindFilter] = useState<
+    'character' | 'summon_skin' | 'effect' | 'all'
+  >('character');
+  const [catalogSortBy, setCatalogSortBy] = useState<'id' | 'name' | 'largest' | 'smallest'>('id');
+  const [catalogAutoThumbnails, setCatalogAutoThumbnails] = useState(true);
+  const [catalogPage, setCatalogPage] = useState(1);
+
   const runExtraction = useCallback(async (urlToScan: string) => {
     const trimmed = urlToScan.trim();
     if (!trimmed) return;
@@ -164,12 +173,12 @@ export default function App() {
         onExportZip={() => void handleGlobalExportZip()}
       />
 
-      <main className="mx-auto w-full max-w-[1440px] flex-1 space-y-6 px-6 py-6">
+      <main className="mx-auto w-full max-w-[1440px] flex-1 space-y-5 px-3 py-4 sm:space-y-6 sm:px-6 sm:py-6">
         <PWAInstallBanner />
 
         {activeTab === 'extractor' && (
-          <div className="space-y-8">
-            <section className="rounded-lg border border-slate-800 bg-[#131A26] p-6 sm:p-8">
+          <div className="space-y-6 sm:space-y-8">
+            <section className="rounded-lg border border-slate-800 bg-[#131A26] p-4 sm:p-8">
               <div className="max-w-3xl space-y-3">
                 <h1 className="font-display text-2xl font-bold tracking-tight text-slate-50 sm:text-3xl text-balance">
                   Extrator de Sprites e Animações Web
@@ -288,7 +297,9 @@ export default function App() {
                         className="inline-flex items-center gap-2 rounded-lg border border-slate-700 bg-[#0B0F17] px-4 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 transition-colors cursor-pointer"
                       >
                         <Sparkles className="h-3.5 w-3.5 text-orange-400" aria-hidden="true" />
-                        <span>Abrir {selectedNinja.id} no Estúdio</span>
+                        <span>
+                          Abrir {selectedNinja.name || selectedNinja.id} no Estúdio
+                        </span>
                       </button>
                     )}
                     {(extractResult.sheets.length > 0 || extractResult.assets.length > 0) && (
@@ -354,19 +365,19 @@ export default function App() {
                       <p className="text-slate-400">
                         No GitHub Pages, o catálogo, miniaturas, animações Spine (<code className="font-mono text-slate-200">.json</code>), folhas, emojis e o download em ZIP dos pacotes funcionam automaticamente via catálogo estático + CDN <code className="font-mono text-slate-200">wsrv.nl</code>. Preencha abaixo apenas se quiser extrair URLs de outros jogos:
                       </p>
-                      <div className="flex gap-2">
+                      <div className="flex flex-col gap-2 sm:flex-row">
                         <input
                           type="url"
                           value={corsProxyInput}
                           onChange={(e) => setCorsProxyInput(e.target.value)}
                           placeholder="Automático (wsrv.nl + pacote local)"
                           aria-label="URL de Proxy CORS"
-                          className="flex-1 rounded-md border border-slate-800 bg-[#131A26] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
+                          className="w-full min-w-0 flex-1 rounded-md border border-slate-800 bg-[#131A26] px-3 py-1.5 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
                         />
                         <button
                           type="button"
                           onClick={handleSaveProxy}
-                          className="rounded-md bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-100 hover:bg-slate-700 cursor-pointer"
+                          className="rounded-md bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-100 hover:bg-slate-700 cursor-pointer shrink-0"
                         >
                           {proxySavedNotice ? 'Salvo' : 'Salvar'}
                         </button>
@@ -381,6 +392,25 @@ export default function App() {
               <NinjaCatalog
                 ninjas={extractResult.ninjas}
                 selectedNinjaId={selectedNinja?.id || null}
+                search={catalogSearch}
+                onSearchChange={(q) => {
+                  setCatalogSearch(q);
+                  setCatalogPage(1);
+                }}
+                kindFilter={catalogKindFilter}
+                onKindFilterChange={(k) => {
+                  setCatalogKindFilter(k);
+                  setCatalogPage(1);
+                }}
+                sortBy={catalogSortBy}
+                onSortByChange={(s) => {
+                  setCatalogSortBy(s);
+                  setCatalogPage(1);
+                }}
+                autoThumbnails={catalogAutoThumbnails}
+                onAutoThumbnailsChange={setCatalogAutoThumbnails}
+                page={catalogPage}
+                onPageChange={setCatalogPage}
                 onSelectNinja={handleSelectNinja}
                 onGoToExtractor={() => setActiveTab('extractor')}
                 onOpenBatchZip={(list) => setBatchZipList(list)}
@@ -393,6 +423,25 @@ export default function App() {
           <NinjaCatalog
             ninjas={extractResult?.ninjas || []}
             selectedNinjaId={selectedNinja?.id || null}
+            search={catalogSearch}
+            onSearchChange={(q) => {
+              setCatalogSearch(q);
+              setCatalogPage(1);
+            }}
+            kindFilter={catalogKindFilter}
+            onKindFilterChange={(k) => {
+              setCatalogKindFilter(k);
+              setCatalogPage(1);
+            }}
+            sortBy={catalogSortBy}
+            onSortByChange={(s) => {
+              setCatalogSortBy(s);
+              setCatalogPage(1);
+            }}
+            autoThumbnails={catalogAutoThumbnails}
+            onAutoThumbnailsChange={setCatalogAutoThumbnails}
+            page={catalogPage}
+            onPageChange={setCatalogPage}
             onSelectNinja={handleSelectNinja}
             onGoToExtractor={() => setActiveTab('extractor')}
             onOpenBatchZip={(list) => setBatchZipList(list)}
@@ -433,10 +482,10 @@ export default function App() {
       <OfflineIndicator />
 
       <footer className="border-t border-slate-800/80 bg-[#0B0F17] py-4">
-        <div className="mx-auto flex max-w-[1440px] flex-wrap items-center justify-between gap-4 px-6 text-xs text-slate-500">
+        <div className="mx-auto flex max-w-[1440px] flex-wrap items-center justify-between gap-2 px-3 sm:px-6 text-xs text-slate-500">
           <span>Shinobi Sprite Studio · Uso recomendado para estudo técnico, referência e prototipagem</span>
           {extractResult && (
-            <span className="font-mono tabular-nums">
+            <span className="truncate font-mono tabular-nums max-w-full">
               Origem: {extractResult.resolvedGameUrl}
             </span>
           )}

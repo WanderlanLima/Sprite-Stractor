@@ -899,6 +899,12 @@ function drawSkeletonAtTime(
   return drawnSlots;
 }
 
+export interface RenderSpineFrameOptions {
+  fillRatio?: number;
+  maxAutoFitScale?: number;
+  followFramePose?: boolean;
+}
+
 export function renderSpineFrameToCanvas(
   ctx: CanvasRenderingContext2D,
   canvasWidth: number,
@@ -911,9 +917,13 @@ export function renderSpineFrameToCanvas(
   panX = 0,
   panY = 0,
   autoFitBounds?: AnimationWorldBounds | null,
-  compositeLayers: CompositeSpineLayer[] = []
+  compositeLayers: CompositeSpineLayer[] = [],
+  options?: RenderSpineFrameOptions
 ): number {
   ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+  const fillRatio = options?.fillRatio ?? 0.86;
+  const maxAutoFitScale = options?.maxAutoFitScale ?? 4.0;
 
   let effectiveScale: number;
   let anchorX: number;
@@ -921,19 +931,42 @@ export function renderSpineFrameToCanvas(
 
   if (autoFitBounds) {
     const fitScale = Math.min(
-      (canvasWidth * 0.86) / autoFitBounds.width,
-      (canvasHeight * 0.86) / autoFitBounds.height
+      (canvasWidth * fillRatio) / autoFitBounds.width,
+      (canvasHeight * fillRatio) / autoFitBounds.height
     );
-    const baseScale = Math.min(4.0, Math.max(0.05, fitScale));
+    const baseScale = Math.min(maxAutoFitScale, Math.max(0.05, fitScale));
     effectiveScale = baseScale * zoom;
-    anchorX = canvasWidth / 2 - autoFitBounds.centerX * effectiveScale + panX;
-    anchorY = canvasHeight / 2 + autoFitBounds.centerY * effectiveScale + panY;
+
+    let targetCenterX = autoFitBounds.centerX;
+    let targetCenterY = autoFitBounds.centerY;
+
+    if (options?.followFramePose && zoom > 1.05) {
+      const frameAcc = {
+        minX: Infinity,
+        maxX: -Infinity,
+        minY: Infinity,
+        maxY: -Infinity,
+      };
+      accumulateSkeletonBoundsAtTime(skeleton, animName, regionCanvasMap, time, frameAcc, {
+        maxSlotSpan: 2400,
+      });
+      if (Number.isFinite(frameAcc.minX) && Number.isFinite(frameAcc.minY)) {
+        const frameCx = (frameAcc.minX + frameAcc.maxX) / 2;
+        const frameCy = (frameAcc.minY + frameAcc.maxY) / 2;
+        const blend = Math.min(1, (zoom - 1.05) / 0.45);
+        targetCenterX = autoFitBounds.centerX + (frameCx - autoFitBounds.centerX) * blend;
+        targetCenterY = autoFitBounds.centerY + (frameCy - autoFitBounds.centerY) * blend;
+      }
+    }
+
+    anchorX = canvasWidth / 2 - targetCenterX * effectiveScale + panX;
+    anchorY = canvasHeight / 2 + targetCenterY * effectiveScale + panY;
   } else {
     const skelBounds = skeleton.skeleton || {};
     const skelW = Math.max(80, skelBounds.width || 160);
     const skelH = Math.max(80, skelBounds.height || 160);
     const baseScale = Math.min((canvasWidth * 0.72) / skelW, (canvasHeight * 0.72) / skelH);
-    effectiveScale = Math.min(3.5, Math.max(0.15, baseScale)) * zoom;
+    effectiveScale = Math.min(maxAutoFitScale, Math.max(0.15, baseScale)) * zoom;
     anchorX = canvasWidth / 2 + panX;
     anchorY = canvasHeight * 0.76 + panY;
   }

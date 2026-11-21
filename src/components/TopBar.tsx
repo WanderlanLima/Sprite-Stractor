@@ -27,11 +27,11 @@ export function TopBar({
 }: TopBarProps) {
   return (
     <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-[#0B0F17]/95 backdrop-blur-sm">
-      <div className="mx-auto flex h-16 max-w-[1440px] items-center justify-between gap-8 px-6">
+      <div className="mx-auto flex h-14 sm:h-16 max-w-[1440px] items-center justify-between gap-3 sm:gap-8 px-3 sm:px-6">
         <button
           type="button"
           onClick={() => onTabChange('extractor')}
-          className="font-display text-lg font-bold tracking-tight text-slate-50 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 rounded"
+          className="font-display text-base sm:text-lg font-bold tracking-tight text-slate-50 truncate cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 rounded"
         >
           Shinobi Sprite Studio
         </button>
@@ -70,7 +70,7 @@ export function TopBar({
             type="button"
             disabled={!canExportZip || isExportingZip}
             onClick={onExportZip}
-            className="inline-flex items-center gap-2 rounded-lg bg-orange-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-orange-500 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400"
+            className="inline-flex items-center gap-1.5 sm:gap-2 rounded-lg bg-orange-600 px-3 sm:px-4 py-1.5 sm:py-2 text-xs font-semibold text-white transition-colors hover:bg-orange-500 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400"
           >
             <Download className="h-3.5 w-3.5" aria-hidden="true" />
             <span>{isExportingZip ? 'Gerando ZIP...' : 'Exportar ZIP'}</span>
@@ -81,7 +81,7 @@ export function TopBar({
       {/* Compact mobile navigation row */}
       <nav
         aria-label="Navegação móvel"
-        className="flex md:hidden items-center gap-4 overflow-x-auto border-t border-slate-800/70 px-4 py-2"
+        className="flex md:hidden items-center gap-1 overflow-x-auto border-t border-slate-800/70 px-2 py-1"
       >
         {NAV_ITEMS.map((item) => {
           const isActive = activeTab === item.id;
@@ -90,11 +90,17 @@ export function TopBar({
               key={item.id}
               type="button"
               onClick={() => onTabChange(item.id)}
-              className={`text-xs font-medium py-1.5 whitespace-nowrap shrink-0 ${
-                isActive ? 'text-orange-400' : 'text-slate-400'
+              className={`relative rounded px-2.5 py-2 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer ${
+                isActive ? 'text-orange-400' : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               {item.label}
+              {isActive && (
+                <span
+                  aria-hidden="true"
+                  className="absolute inset-x-2 bottom-0 h-0.5 bg-orange-500"
+                />
+              )}
             </button>
           );
         })}
