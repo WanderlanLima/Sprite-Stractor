@@ -118,21 +118,64 @@ function resolveRelativeUrl(baseUrl: string, ref: string): string | null {
   }
 }
 
-function categorizeAsset(urlStr: string): 'ui' | 'item' | 'bg' | 'sprite' | 'other' {
+function categorizeAsset(
+  urlStr: string
+): 'emoji' | 'hero' | 'item' | 'ui' | 'bg' | 'sprite' | 'other' {
   const lower = urlStr.toLowerCase();
-  if (lower.includes('/spine/') || lower.includes('/heros/') || lower.includes('/hero') || lower.includes('ninja') || lower.includes('character')) {
+  if (lower.includes('vdf-emoji') || lower.includes('/emoji')) {
+    return 'emoji';
+  }
+  if (lower.includes('/heros/') || lower.includes('/expression/') || lower.includes('/fichano/')) {
+    return 'hero';
+  }
+  if (lower.includes('/spine/') || lower.includes('/hero') || lower.includes('ninja') || lower.includes('character')) {
     return 'sprite';
   }
-  if (lower.includes('/items/') || lower.includes('item_') || lower.includes('icone') || lower.includes('icon')) {
+  if (
+    lower.includes('/items/') ||
+    lower.includes('item_') ||
+    lower.includes('/rune/') ||
+    lower.includes('icone') ||
+    lower.includes('icon')
+  ) {
     return 'item';
   }
-  if (lower.includes('/bg/') || lower.includes('bg_') || lower.includes('moldura') || lower.includes('banner')) {
+  if (
+    lower.includes('/bg/') ||
+    lower.includes('bg_') ||
+    lower.includes('adventurebg') ||
+    lower.includes('moldura') ||
+    lower.includes('banner')
+  ) {
     return 'bg';
   }
-  if (lower.includes('/ui/') || lower.includes('botao') || lower.includes('titulo')) {
+  if (
+    lower.includes('/ui/') ||
+    lower.includes('/templo/') ||
+    lower.includes('/titulos-no/') ||
+    lower.includes('/barra-no/') ||
+    lower.includes('/chat-no/') ||
+    lower.includes('vipplacas') ||
+    lower.includes('botao') ||
+    lower.includes('titulo')
+  ) {
     return 'ui';
   }
   return 'other';
+}
+
+function classifySpinePackageKind(id: string): 'character' | 'summon_skin' | 'effect' {
+  const lower = id.toLowerCase();
+  if (lower.startsWith('vdfno_')) return 'character';
+  if (
+    lower.endsWith('_effect') ||
+    lower.endsWith('_highteffect') ||
+    lower.endsWith('_ground') ||
+    lower.includes('huomiao')
+  ) {
+    return 'effect';
+  }
+  return 'summon_skin';
 }
 
 function extractTitle(html: string): string {
@@ -518,6 +561,8 @@ async function createServer() {
         offsetY: number;
         atlasUrl: string;
         skeletonUrl: string;
+        kind: 'character' | 'summon_skin' | 'effect';
+        sourceIndex: 'spine-hd' | 'spine-astc' | 'code';
       }> = [];
 
       const sheets: Array<{
@@ -526,6 +571,7 @@ async function createServer() {
         width?: number;
         height?: number;
         bytes?: number;
+        sheetKind: 'astc_sheet' | 'spine_sheet';
       }> = [];
 
       // Look for spine index JSONs (e.g. acervo/asset/spine-hd/indice.json) and spritesheet list JSONs
@@ -582,22 +628,44 @@ async function createServer() {
                   offsetY: typeof obj.y === 'number' ? Number(obj.y.toFixed(1)) : 0,
                   atlasUrl: `${defaultSpineBase}/${key}.atlas`,
                   skeletonUrl: `${defaultSpineBase}/${key}.json`,
+                  kind: classifySpinePackageKind(key),
+                  sourceIndex: 'spine-hd',
                 });
               }
 
-              // Spritesheet list index (e.g. "no_11000131.webp": { w, h, bytes })
+              // Spritesheet list index (e.g. "no_11000131.webp": { w, h, bytes } or "Wanshe.webp": { w, h, bytes })
               if (
                 /\.(webp|png|jpe?g)$/i.test(key) &&
                 typeof obj.w === 'number' &&
                 typeof obj.h === 'number'
               ) {
+                const isNoSheet = key.toLowerCase().startsWith('no_');
                 sheets.push({
                   name: key,
                   url: `${defaultSpineBase}/${key}`,
                   width: obj.w,
                   height: obj.h,
                   bytes: typeof obj.bytes === 'number' ? obj.bytes : undefined,
+                  sheetKind: isNoSheet ? 'astc_sheet' : 'spine_sheet',
                 });
+
+                // Non-`no_*` entries in lista.json (186 summons, skins & effects) are complete Spine packages in /spine/
+                if (!isNoSheet && !key.toLowerCase().startsWith('vdfno_')) {
+                  const baseId = key.replace(/\.(webp|png|jpe?g)$/i, '');
+                  const codeMatch = baseId.match(/(\d+)$/);
+                  ninjas.push({
+                    id: baseId,
+                    code: codeMatch ? codeMatch[1] : baseId,
+                    width: Math.round(obj.w),
+                    height: Math.round(obj.h),
+                    offsetX: 0,
+                    offsetY: 0,
+                    atlasUrl: `${defaultSpineBase}/${baseId}.atlas`,
+                    skeletonUrl: `${defaultSpineBase}/${baseId}.json`,
+                    kind: classifySpinePackageKind(baseId),
+                    sourceIndex: 'spine-astc',
+                  });
+                }
               }
             }
           } catch {
@@ -606,8 +674,56 @@ async function createServer() {
         })
       );
 
-      // Deduplicate & sort ninjas and sheets
-      const uniqueNinjas = Array.from(new Map(ninjas.map((n) => [n.id, n])).values()).sort((a, b) =>
+      // Deduplicate keeping spine-hd metadata priority over spine-astc
+      const ninjaMap = new Map<string, (typeof ninjas)[number]>();
+      for (const n of ninjas) {
+        const prev = ninjaMap.get(n.id);
+        if (!prev || (prev.sourceIndex !== 'spine-hd' && n.sourceIndex === 'spine-hd')) {
+          ninjaMap.set(n.id, n);
+        }
+      }
+
+      // Check direct /spine/<name>.png|webp references discovered in scripts (e.g., huomiao.png)
+      const directSpineCandidates = Array.from(imageUrls).filter((u) => {
+        const lower = u.toLowerCase();
+        if (!lower.includes('/spine/')) return false;
+        const file = lower.split('?')[0].split('/').pop() || '';
+        const base = file.replace(/\.(png|webp|jpe?g)$/i, '');
+        return Boolean(base) && !base.startsWith('no_') && !ninjaMap.has(base);
+      });
+
+      await Promise.all(
+        directSpineCandidates.slice(0, 12).map(async (imgUrl) => {
+          try {
+            const clean = imgUrl.split('?')[0];
+            const file = clean.split('/').pop() || '';
+            const baseId = file.replace(/\.(png|webp|jpe?g)$/i, '');
+            const atlasCandidate = clean.replace(/\.(png|webp|jpe?g)$/i, '.atlas');
+            const skelCandidate = clean.replace(/\.(png|webp|jpe?g)$/i, '.json');
+            const headResp = await fetchWithTimeout(atlasCandidate, 4000, 'text/plain,*/*');
+            if (!headResp.ok) return;
+            const headText = await headResp.text();
+            if (!headText || headText.trimStart().startsWith('<')) return;
+            const codeMatch = baseId.match(/(\d+)$/);
+            ninjaMap.set(baseId, {
+              id: baseId,
+              code: codeMatch ? codeMatch[1] : baseId,
+              width: 256,
+              height: 256,
+              offsetX: 0,
+              offsetY: 0,
+              atlasUrl: atlasCandidate,
+              skeletonUrl: skelCandidate,
+              kind: classifySpinePackageKind(baseId),
+              sourceIndex: 'code',
+            });
+          } catch {
+            // ignore non-Spine loose images
+          }
+        })
+      );
+
+      const uniqueNinjas = Array.from(ninjaMap.values()).sort((a, b) =>
         a.id.localeCompare(b.id, undefined, { numeric: true })
       );
 
@@ -787,28 +903,42 @@ async function createServer() {
         return;
       }
 
-      let targetName = regions[0].name;
+      const largestRegion = regions.reduce(
+        (best, r) => (r.width * r.height > best.width * best.height ? r : best),
+        regions[0]
+      );
+      let targetName = largestRegion.name;
       if (skelResp && skelResp.ok) {
         try {
           const skel = (await skelResp.json()) as {
-            animations?: {
-              idle?: {
-                slots?: Record<string, { attachment?: Array<{ name?: string | null }> }>;
-              };
-            };
+            animations?: Record<
+              string,
+              { slots?: Record<string, { attachment?: Array<{ name?: string | null }> }> }
+            >;
           };
-          const idleSlots = skel?.animations?.idle?.slots;
-          if (idleSlots) {
-            const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
-            const firstAtt = preferredSlot?.attachment?.find((a) => typeof a.name === 'string');
-            if (firstAtt?.name) targetName = firstAtt.name;
+          const anims = skel?.animations || {};
+          const animOrder = ['idle', 'stand', 'animation', 'skill', 'attack', ...Object.keys(anims)];
+          for (const animKey of animOrder) {
+            const slots = anims[animKey]?.slots;
+            if (!slots) continue;
+            const slotOrder = [slots.L0, ...Object.values(slots)].filter(Boolean);
+            let foundMatch = false;
+            for (const slotAnim of slotOrder) {
+              const firstAtt = slotAnim?.attachment?.find((a) => typeof a.name === 'string');
+              if (firstAtt?.name && regions.some((r) => r.name === firstAtt.name)) {
+                targetName = firstAtt.name;
+                foundMatch = true;
+                break;
+              }
+            }
+            if (foundMatch) break;
           }
         } catch {
-          // fallback to first region
+          // fallback to largest region
         }
       }
 
-      const region = regions.find((r) => r.name === targetName) || regions[0];
+      const region = regions.find((r) => r.name === targetName) || largestRegion;
       const pageUrl = resolveRelativeUrl(validAtlasUrl.toString(), region.pageName);
       if (!pageUrl) {
         res.status(404).end();

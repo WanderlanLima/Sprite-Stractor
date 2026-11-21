@@ -2,13 +2,21 @@ import { GIFEncoder, applyPalette, quantize } from 'gifenc';
 import type {
   AtlasPage,
   AtlasRegion,
+  CompositeSpineLayer,
   SlicedFrame,
   SpineAnimationData,
   SpineAttachmentInfo,
   SpineBoneDef,
+  SpineCommandEffectRef,
+  SpineSlotDef,
   SpineSkeleton,
 } from '../types/sprite';
 import { createZipWorkerSession } from './zipWorkerClient';
+import {
+  assembleStreamingZipBlob,
+  computeCrc32,
+  type StreamingZipEntry,
+} from './streamingZip';
 
 export function parseAtlas(atlasText: string): AtlasPage[] {
   const lines = atlasText.split(/\r?\n/);
@@ -264,6 +272,9 @@ export function getAnimationDuration(skeleton: SpineSkeleton, animName: string):
       for (const kf of boneAnim.scale || []) {
         if ((kf.time || 0) > maxTime) maxTime = kf.time || 0;
       }
+      for (const kf of boneAnim.shear || []) {
+        if ((kf.time || 0) > maxTime) maxTime = kf.time || 0;
+      }
     }
   }
 
@@ -273,6 +284,76 @@ export function getAnimationDuration(skeleton: SpineSkeleton, animName: string):
 
   // Add 1 frame hold so last keyframe is visible
   return maxTime > 0 ? maxTime + 1 / 24 : 0.5;
+}
+
+export function extractSpineEffectRefs(
+  skeleton: SpineSkeleton | null | undefined,
+  animName: string
+): SpineCommandEffectRef[] {
+  if (!skeleton || !animName) return [];
+  const anim = skeleton.animations?.[animName];
+  if (!anim?.events?.length) return [];
+
+  const refs: SpineCommandEffectRef[] = [];
+  const seen = new Set<string>();
+
+  for (const ev of anim.events) {
+    if (!ev.string) continue;
+    const cmdMatches = ev.string.matchAll(/\{([A-Za-z0-9_]+):([^}]+)\}/g);
+    for (const m of cmdMatches) {
+      const cmdType = m[1];
+      const body = m[2];
+      if (!cmdType.startsWith('DISPLAY')) continue;
+
+      const spineMatch = body.match(/spine\s*=\s*["']([^"']+)["']/);
+      const sourceMatch = body.match(/source\s*=\s*["']([^"']+)["']/);
+      if (!spineMatch?.[1] || !sourceMatch?.[1]) continue;
+
+      const layerMatch = body.match(/layer\s*=\s*["']([^"']+)["']/);
+      const loopMatch = body.match(/loop\s*=\s*["']([^"']+)["']/);
+      const hasSelfTarget = /targets\s*=\s*\[[^\]]*["']self["'][^\]]*\]/.test(body);
+
+      const spineId = spineMatch[1].trim();
+      const effectAnim = sourceMatch[1].trim();
+      const layerVal = (layerMatch?.[1] || '').toLowerCase();
+      const layer: 'behind' | 'front' =
+        layerVal === 'rbg' || layerVal === 'bg' ? 'behind' : 'front';
+      const loopVal = (loopMatch?.[1] || '').toLowerCase();
+      const loop = loopVal === 'true' || loopVal === '1' || loopVal === 'loop';
+      const isSelfOrScreen = cmdType === 'DISPLAY' || hasSelfTarget;
+      const startTime = Math.max(0, ev.time || 0);
+
+      const key = `${spineId}::${effectAnim}::${startTime.toFixed(4)}::${layer}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      refs.push({
+        spineId,
+        animName: effectAnim,
+        startTime,
+        layer,
+        isSelfOrScreen,
+        loop,
+        rawCommand: m[0],
+      });
+    }
+  }
+
+  return refs;
+}
+
+export function getCompositeAnimationDuration(
+  baseDuration: number,
+  layers: CompositeSpineLayer[] = []
+): number {
+  let total = baseDuration;
+  for (const layer of layers) {
+    if (!layer.loop && layer.duration > 0) {
+      const end = layer.startTime + Math.min(layer.duration, 8);
+      if (end > total) total = end;
+    }
+  }
+  return total;
 }
 
 function sampleLinear(
@@ -356,19 +437,55 @@ function makeLocalMat(
   y: number,
   rotDeg: number,
   sx: number,
-  sy: number
+  sy: number,
+  shearX = 0,
+  shearY = 0
 ): Mat2D {
-  const rad = (rotDeg * Math.PI) / 180;
-  const cos = Math.cos(rad);
-  const sin = Math.sin(rad);
+  const radX = ((rotDeg + shearX) * Math.PI) / 180;
+  const radY = ((rotDeg + 90 + shearY) * Math.PI) / 180;
   return {
-    a: cos * sx,
-    b: sin * sx,
-    c: -sin * sy,
-    d: cos * sy,
+    a: Math.cos(radX) * sx,
+    b: Math.sin(radX) * sx,
+    c: Math.cos(radY) * sy,
+    d: Math.sin(radY) * sy,
     tx: x,
     ty: y,
   };
+}
+
+function parseHexAlpha(colorHex?: string): number {
+  if (!colorHex || colorHex.length < 8) return 1;
+  const alphaByte = parseInt(colorHex.slice(6, 8), 16);
+  if (Number.isNaN(alphaByte)) return 1;
+  return Math.max(0, Math.min(1, alphaByte / 255));
+}
+
+function sampleSlotAlpha(
+  slot: SpineSlotDef,
+  anim: SpineAnimationData | undefined,
+  time: number
+): number {
+  const baseAlpha = parseHexAlpha(slot.color);
+  const frames = anim?.slots?.[slot.name]?.color;
+  if (!frames || frames.length === 0) return baseAlpha;
+
+  const firstTime = frames[0].time || 0;
+  if (time <= firstTime) return parseHexAlpha(frames[0].color);
+
+  for (let i = 0; i < frames.length - 1; i++) {
+    const a = frames[i];
+    const b = frames[i + 1];
+    const ta = a.time || 0;
+    const tb = b.time || 0;
+    if (time >= ta && time <= tb) {
+      const va = parseHexAlpha(a.color);
+      const vb = parseHexAlpha(b.color);
+      if (a.curve === 'stepped' || tb === ta) return va;
+      const alpha = (time - ta) / (tb - ta);
+      return va + (vb - va) * alpha;
+    }
+  }
+  return parseHexAlpha(frames[frames.length - 1].color);
 }
 
 export interface AnimationWorldBounds {
@@ -430,8 +547,10 @@ function createWorldMatrixResolver(
     const lrot = (def.rotation || 0) + sampleAngle(boneAnim?.rotate, time);
     const lsx = (def.scaleX ?? 1) * sampleLinear(boneAnim?.scale, time, 'x', 1);
     const lsy = (def.scaleY ?? 1) * sampleLinear(boneAnim?.scale, time, 'y', 1);
+    const lshx = (def.shearX || 0) + sampleLinear(boneAnim?.shear, time, 'x', 0);
+    const lshy = (def.shearY || 0) + sampleLinear(boneAnim?.shear, time, 'y', 0);
 
-    const local = makeLocalMat(lx, ly, lrot, lsx, lsy);
+    const local = makeLocalMat(lx, ly, lrot, lsx, lsy, lshx, lshy);
     const world = def.parent ? mulMat(getWorldMatrix(def.parent), local) : local;
     worldMatrices.set(boneName, world);
     return world;
@@ -472,67 +591,104 @@ function collectSampleTimes(
   return Array.from(times).sort((a, b) => a - b);
 }
 
+function accumulateSkeletonBoundsAtTime(
+  skeleton: SpineSkeleton,
+  animName: string,
+  regionCanvasMap: Map<string, HTMLCanvasElement>,
+  t: number,
+  boundsAcc: { minX: number; maxX: number; minY: number; maxY: number }
+) {
+  const anim = skeleton.animations?.[animName];
+  const slotsDef = skeleton.slots || [];
+  const skinAttachments = getDefaultSkinAttachments(skeleton);
+  const boneMap = buildBoneMap(skeleton);
+  const getWorldMatrix = createWorldMatrixResolver(boneMap, anim, t);
+
+  for (const slot of slotsDef) {
+    const attachmentName = resolveSlotAttachmentAtTime(slot.name, slot.attachment, anim, t);
+    if (!attachmentName) continue;
+    if (sampleSlotAlpha(slot, anim, t) <= 0.01) continue;
+
+    const attInfo = skinAttachments[slot.name]?.[attachmentName];
+    const regionKey = attInfo?.path || attInfo?.name || attachmentName;
+    const spriteCanvas = regionCanvasMap.get(regionKey);
+    if (!spriteCanvas) continue;
+
+    const wm = getWorldMatrix(slot.bone);
+    const localMat = makeLocalMat(
+      attInfo?.x || 0,
+      attInfo?.y || 0,
+      attInfo?.rotation || 0,
+      attInfo?.scaleX ?? 1,
+      attInfo?.scaleY ?? 1
+    );
+    const finalMat = mulMat(wm, localMat);
+
+    const hw = (attInfo?.width || spriteCanvas.width) / 2;
+    const hh = (attInfo?.height || spriteCanvas.height) / 2;
+
+    const corners: Array<[number, number]> = [
+      [-hw, -hh],
+      [hw, -hh],
+      [hw, hh],
+      [-hw, hh],
+    ];
+    for (const [cx, cy] of corners) {
+      const wx = finalMat.a * cx + finalMat.c * cy + finalMat.tx;
+      const wy = finalMat.b * cx + finalMat.d * cy + finalMat.ty;
+      if (wx < boundsAcc.minX) boundsAcc.minX = wx;
+      if (wx > boundsAcc.maxX) boundsAcc.maxX = wx;
+      if (wy < boundsAcc.minY) boundsAcc.minY = wy;
+      if (wy > boundsAcc.maxY) boundsAcc.maxY = wy;
+    }
+  }
+}
+
 export function computeAnimationWorldBounds(
   skeleton: SpineSkeleton,
   animName: string,
   regionCanvasMap: Map<string, HTMLCanvasElement>,
   samples = 24
 ): AnimationWorldBounds {
+  return computeCompositeAnimationWorldBounds(skeleton, animName, regionCanvasMap, [], samples);
+}
+
+export function computeCompositeAnimationWorldBounds(
+  skeleton: SpineSkeleton,
+  animName: string,
+  regionCanvasMap: Map<string, HTMLCanvasElement>,
+  compositeLayers: CompositeSpineLayer[] = [],
+  samples = 24
+): AnimationWorldBounds {
   const anim = skeleton.animations?.[animName];
-  const slotsDef = skeleton.slots || [];
-  const skinAttachments = getDefaultSkinAttachments(skeleton);
-  const boneMap = buildBoneMap(skeleton);
-  const duration = getAnimationDuration(skeleton, animName);
+  const baseDuration = getAnimationDuration(skeleton, animName);
+  const boundsAcc = {
+    minX: Infinity,
+    maxX: -Infinity,
+    minY: Infinity,
+    maxY: -Infinity,
+  };
 
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-
-  const sampleTimes = collectSampleTimes(anim, duration, samples);
+  const sampleTimes = collectSampleTimes(anim, baseDuration, samples);
   for (const t of sampleTimes) {
-    const getWorldMatrix = createWorldMatrixResolver(boneMap, anim, t);
+    accumulateSkeletonBoundsAtTime(skeleton, animName, regionCanvasMap, t, boundsAcc);
+  }
 
-    for (const slot of slotsDef) {
-      const attachmentName = resolveSlotAttachmentAtTime(slot.name, slot.attachment, anim, t);
-      if (!attachmentName) continue;
-
-      const attInfo = skinAttachments[slot.name]?.[attachmentName];
-      const regionKey = attInfo?.path || attInfo?.name || attachmentName;
-      const spriteCanvas = regionCanvasMap.get(regionKey);
-      if (!spriteCanvas) continue;
-
-      const wm = getWorldMatrix(slot.bone);
-      const localMat = makeLocalMat(
-        attInfo?.x || 0,
-        attInfo?.y || 0,
-        attInfo?.rotation || 0,
-        attInfo?.scaleX ?? 1,
-        attInfo?.scaleY ?? 1
+  for (const layer of compositeLayers) {
+    const layerAnim = layer.skeleton.animations?.[layer.animName];
+    const layerSampleTimes = collectSampleTimes(layerAnim, layer.duration, Math.min(samples, 16));
+    for (const lt of layerSampleTimes) {
+      accumulateSkeletonBoundsAtTime(
+        layer.skeleton,
+        layer.animName,
+        layer.regionCanvasMap,
+        lt,
+        boundsAcc
       );
-      const finalMat = mulMat(wm, localMat);
-
-      const hw = (attInfo?.width || spriteCanvas.width) / 2;
-      const hh = (attInfo?.height || spriteCanvas.height) / 2;
-
-      const corners: Array<[number, number]> = [
-        [-hw, -hh],
-        [hw, -hh],
-        [hw, hh],
-        [-hw, hh],
-      ];
-      for (const [cx, cy] of corners) {
-        const wx = finalMat.a * cx + finalMat.c * cy + finalMat.tx;
-        const wy = finalMat.b * cx + finalMat.d * cy + finalMat.ty;
-        if (wx < minX) minX = wx;
-        if (wx > maxX) maxX = wx;
-        if (wy < minY) minY = wy;
-        if (wy > maxY) maxY = wy;
-      }
     }
   }
 
-  if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+  if (!Number.isFinite(boundsAcc.minX) || !Number.isFinite(boundsAcc.minY)) {
     const skelW = Math.max(80, skeleton.skeleton?.width || 160);
     const skelH = Math.max(80, skeleton.skeleton?.height || 160);
     return {
@@ -547,18 +703,77 @@ export function computeAnimationWorldBounds(
     };
   }
 
-  const width = Math.max(16, maxX - minX);
-  const height = Math.max(16, maxY - minY);
+  const width = Math.max(16, boundsAcc.maxX - boundsAcc.minX);
+  const height = Math.max(16, boundsAcc.maxY - boundsAcc.minY);
   return {
-    minX,
-    maxX,
-    minY,
-    maxY,
+    minX: boundsAcc.minX,
+    maxX: boundsAcc.maxX,
+    minY: boundsAcc.minY,
+    maxY: boundsAcc.maxY,
     width,
     height,
-    centerX: (minX + maxX) / 2,
-    centerY: (minY + maxY) / 2,
+    centerX: (boundsAcc.minX + boundsAcc.maxX) / 2,
+    centerY: (boundsAcc.minY + boundsAcc.maxY) / 2,
   };
+}
+
+function drawSkeletonAtTime(
+  ctx: CanvasRenderingContext2D,
+  skeleton: SpineSkeleton,
+  animName: string,
+  time: number,
+  regionCanvasMap: Map<string, HTMLCanvasElement>
+): number {
+  const anim = skeleton.animations?.[animName];
+  const slotsDef = skeleton.slots || [];
+  const skinAttachments = getDefaultSkinAttachments(skeleton);
+  const boneMap = buildBoneMap(skeleton);
+  const getWorldMatrix = createWorldMatrixResolver(boneMap, anim, time);
+
+  let drawnSlots = 0;
+
+  for (const slot of slotsDef) {
+    const attachmentName = resolveSlotAttachmentAtTime(slot.name, slot.attachment, anim, time);
+    if (!attachmentName) continue;
+
+    const slotAlpha = sampleSlotAlpha(slot, anim, time);
+    if (slotAlpha <= 0.004) continue;
+
+    const attInfo = skinAttachments[slot.name]?.[attachmentName];
+    const regionKey = attInfo?.path || attInfo?.name || attachmentName;
+    const spriteCanvas = regionCanvasMap.get(regionKey);
+    if (!spriteCanvas) continue;
+
+    const wm = getWorldMatrix(slot.bone);
+    ctx.save();
+    ctx.transform(wm.a, wm.b, wm.c, wm.d, wm.tx, wm.ty);
+
+    if (slot.blend === 'additive') {
+      ctx.globalCompositeOperation = 'lighter';
+    }
+    if (slotAlpha < 0.996) {
+      ctx.globalAlpha *= slotAlpha;
+    }
+
+    const ax = attInfo?.x || 0;
+    const ay = attInfo?.y || 0;
+    const arot = ((attInfo?.rotation || 0) * Math.PI) / 180;
+    const asx = attInfo?.scaleX ?? 1;
+    const asy = attInfo?.scaleY ?? 1;
+    const aw = attInfo?.width || spriteCanvas.width;
+    const ah = attInfo?.height || spriteCanvas.height;
+
+    ctx.translate(ax, ay);
+    if (arot !== 0) ctx.rotate(arot);
+    // Negate Y scale to draw upright canvas image inside Spine Y-up space
+    ctx.scale(asx, -asy);
+    ctx.drawImage(spriteCanvas, -aw / 2, -ah / 2, aw, ah);
+
+    ctx.restore();
+    drawnSlots++;
+  }
+
+  return drawnSlots;
 }
 
 export function renderSpineFrameToCanvas(
@@ -572,15 +787,10 @@ export function renderSpineFrameToCanvas(
   zoom = 1,
   panX = 0,
   panY = 0,
-  autoFitBounds?: AnimationWorldBounds | null
+  autoFitBounds?: AnimationWorldBounds | null,
+  compositeLayers: CompositeSpineLayer[] = []
 ): number {
   ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-
-  const anim = skeleton.animations?.[animName];
-  const slotsDef = skeleton.slots || [];
-  const skinAttachments = getDefaultSkinAttachments(skeleton);
-  const boneMap = buildBoneMap(skeleton);
-  const getWorldMatrix = createWorldMatrixResolver(boneMap, anim, time);
 
   let effectiveScale: number;
   let anchorX: number;
@@ -591,7 +801,7 @@ export function renderSpineFrameToCanvas(
       (canvasWidth * 0.86) / autoFitBounds.width,
       (canvasHeight * 0.86) / autoFitBounds.height
     );
-    const baseScale = Math.min(4.0, Math.max(0.08, fitScale));
+    const baseScale = Math.min(4.0, Math.max(0.05, fitScale));
     effectiveScale = baseScale * zoom;
     anchorX = canvasWidth / 2 - autoFitBounds.centerX * effectiveScale + panX;
     anchorY = canvasHeight / 2 + autoFitBounds.centerY * effectiveScale + panY;
@@ -612,50 +822,29 @@ export function renderSpineFrameToCanvas(
   ctx.translate(anchorX, anchorY);
   ctx.scale(effectiveScale, -effectiveScale);
 
-  for (const slot of slotsDef) {
-    let attachmentName: string | null | undefined = slot.attachment;
-    const slotTimeline = anim?.slots?.[slot.name]?.attachment;
-    if (slotTimeline && slotTimeline.length > 0) {
-      for (let i = 0; i < slotTimeline.length; i++) {
-        if ((slotTimeline[i].time || 0) <= time + 1e-5) {
-          attachmentName = slotTimeline[i].name ?? null;
-        } else {
-          break;
-        }
-      }
-    }
+  const renderLayer = (layer: CompositeSpineLayer) => {
+    if (time < layer.startTime) return;
+    const elapsed = time - layer.startTime;
+    if (!layer.loop && elapsed > layer.duration) return;
+    const localT =
+      layer.loop && layer.duration > 0 ? elapsed % layer.duration : elapsed;
+    drawnSlots += drawSkeletonAtTime(
+      ctx,
+      layer.skeleton,
+      layer.animName,
+      localT,
+      layer.regionCanvasMap
+    );
+  };
 
-    if (!attachmentName) continue;
+  for (const layer of compositeLayers) {
+    if (layer.layer === 'behind') renderLayer(layer);
+  }
 
-    const attInfo = skinAttachments[slot.name]?.[attachmentName];
-    const regionKey = attInfo?.path || attInfo?.name || attachmentName;
-    const spriteCanvas = regionCanvasMap.get(regionKey);
-    if (!spriteCanvas) continue;
+  drawnSlots += drawSkeletonAtTime(ctx, skeleton, animName, time, regionCanvasMap);
 
-    const wm = getWorldMatrix(slot.bone);
-    ctx.save();
-    ctx.transform(wm.a, wm.b, wm.c, wm.d, wm.tx, wm.ty);
-
-    if (slot.blend === 'additive') {
-      ctx.globalCompositeOperation = 'lighter';
-    }
-
-    const ax = attInfo?.x || 0;
-    const ay = attInfo?.y || 0;
-    const arot = ((attInfo?.rotation || 0) * Math.PI) / 180;
-    const asx = attInfo?.scaleX ?? 1;
-    const asy = attInfo?.scaleY ?? 1;
-    const aw = attInfo?.width || spriteCanvas.width;
-    const ah = attInfo?.height || spriteCanvas.height;
-
-    ctx.translate(ax, ay);
-    if (arot !== 0) ctx.rotate(arot);
-    // Negate Y scale to draw upright canvas image inside Spine Y-up space
-    ctx.scale(asx, -asy);
-    ctx.drawImage(spriteCanvas, -aw / 2, -ah / 2, aw, ah);
-
-    ctx.restore();
-    drawnSlots++;
+  for (const layer of compositeLayers) {
+    if (layer.layer === 'front') renderLayer(layer);
   }
 
   ctx.restore();
@@ -874,6 +1063,7 @@ export async function exportFramesAsZip(
     atlasName?: string;
     skeletonJson?: unknown;
     skeletonName?: string;
+    extraFiles?: Array<{ path: string; data: Uint8Array | string }>;
   }
 ) {
   const session = createZipWorkerSession();
@@ -893,6 +1083,11 @@ export async function exportFramesAsZip(
         path: extras.skeletonName,
         data: JSON.stringify(extras.skeletonJson, null, 2),
       });
+    }
+    if (extras?.extraFiles?.length) {
+      for (const extra of extras.extraFiles) {
+        batch.push(extra);
+      }
     }
     await session.addFilesBatch(batch);
     const blob = await session.generateBlob(undefined, 'STORE');
@@ -955,11 +1150,19 @@ export function exportAnimationStripPng(
   skeleton: SpineSkeleton,
   animName: string,
   regionCanvasMap: Map<string, HTMLCanvasElement>,
-  fps = 16
+  fps = 16,
+  compositeLayers: CompositeSpineLayer[] = []
 ): { dataUrl: string; frameCount: number; cellWidth: number; cellHeight: number } {
-  const duration = getAnimationDuration(skeleton, animName);
+  const baseDuration = getAnimationDuration(skeleton, animName);
+  const duration = getCompositeAnimationDuration(baseDuration, compositeLayers);
   const frameCount = Math.max(1, Math.min(60, Math.round(duration * fps)));
-  const bounds = computeAnimationWorldBounds(skeleton, animName, regionCanvasMap, 24);
+  const bounds = computeCompositeAnimationWorldBounds(
+    skeleton,
+    animName,
+    regionCanvasMap,
+    compositeLayers,
+    24
+  );
   const cellW = Math.max(128, Math.min(512, Math.ceil(bounds.width * 1.16)));
   const cellH = Math.max(128, Math.min(512, Math.ceil(bounds.height * 1.16)));
 
@@ -990,7 +1193,8 @@ export function exportAnimationStripPng(
         1,
         0,
         0,
-        bounds
+        bounds,
+        compositeLayers
       );
       const col = i % cols;
       const row = Math.floor(i / cols);
@@ -1006,6 +1210,74 @@ export function exportAnimationStripPng(
   };
 }
 
+export async function exportAnimationStripPngBlob(
+  skeleton: SpineSkeleton,
+  animName: string,
+  regionCanvasMap: Map<string, HTMLCanvasElement>,
+  fps = 16,
+  compositeLayers: CompositeSpineLayer[] = [],
+  precomputedBounds?: AnimationWorldBounds | null
+): Promise<{ blob: Blob | null; frameCount: number; cellWidth: number; cellHeight: number }> {
+  const baseDuration = getAnimationDuration(skeleton, animName);
+  const duration = getCompositeAnimationDuration(baseDuration, compositeLayers);
+  const frameCount = Math.max(1, Math.min(60, Math.round(duration * fps)));
+  const bounds =
+    precomputedBounds ||
+    computeCompositeAnimationWorldBounds(
+      skeleton,
+      animName,
+      regionCanvasMap,
+      compositeLayers,
+      24
+    );
+  const cellW = Math.max(128, Math.min(512, Math.ceil(bounds.width * 1.16)));
+  const cellH = Math.max(128, Math.min(512, Math.ceil(bounds.height * 1.16)));
+
+  const cols = Math.min(frameCount, 8);
+  const rows = Math.ceil(frameCount / cols);
+
+  const sheetCanvas = document.createElement('canvas');
+  sheetCanvas.width = cols * cellW;
+  sheetCanvas.height = rows * cellH;
+  const sheetCtx = sheetCanvas.getContext('2d');
+
+  const frameCanvas = document.createElement('canvas');
+  frameCanvas.width = cellW;
+  frameCanvas.height = cellH;
+  const frameCtx = frameCanvas.getContext('2d');
+
+  if (sheetCtx && frameCtx) {
+    for (let i = 0; i < frameCount; i++) {
+      const t = frameCount === 1 ? 0 : (i / frameCount) * duration;
+      renderSpineFrameToCanvas(
+        frameCtx,
+        cellW,
+        cellH,
+        skeleton,
+        animName,
+        t,
+        regionCanvasMap,
+        1,
+        0,
+        0,
+        bounds,
+        compositeLayers
+      );
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      sheetCtx.drawImage(frameCanvas, col * cellW, row * cellH);
+    }
+  }
+
+  const blob = await canvasToPngBlob(sheetCanvas);
+  return {
+    blob,
+    frameCount,
+    cellWidth: cellW,
+    cellHeight: cellH,
+  };
+}
+
 export async function exportAnimationGif(
   skeleton: SpineSkeleton,
   animName: string,
@@ -1014,17 +1286,27 @@ export async function exportAnimationGif(
     fps?: number;
     bounds?: AnimationWorldBounds | null;
     backgroundColor?: string | null;
+    compositeLayers?: CompositeSpineLayer[];
     onProgress?: (percent: number) => void;
   }
 ): Promise<{ blob: Blob; frameCount: number; width: number; height: number }> {
   const fps = options?.fps ?? 18;
-  const duration = getAnimationDuration(skeleton, animName);
+  const compositeLayers = options?.compositeLayers || [];
+  const baseDuration = getAnimationDuration(skeleton, animName);
+  const duration = getCompositeAnimationDuration(baseDuration, compositeLayers);
   const frameCount =
     duration <= 0 ? 1 : Math.max(1, Math.min(72, Math.round(duration * fps)));
   const delayMs = duration <= 0 ? 100 : Math.max(20, Math.round((duration / frameCount) * 1000));
 
   const bounds =
-    options?.bounds || computeAnimationWorldBounds(skeleton, animName, regionCanvasMap, 24);
+    options?.bounds ||
+    computeCompositeAnimationWorldBounds(
+      skeleton,
+      animName,
+      regionCanvasMap,
+      compositeLayers,
+      24
+    );
   const cellW = Math.max(160, Math.min(512, Math.ceil(bounds.width * 1.16)));
   const cellH = Math.max(160, Math.min(512, Math.ceil(bounds.height * 1.16)));
 
@@ -1050,7 +1332,8 @@ export async function exportAnimationGif(
         1,
         0,
         0,
-        bounds
+        bounds,
+        compositeLayers
       );
 
       if (bgColor) {
@@ -1083,7 +1366,7 @@ export async function exportAnimationGif(
         const opaqueMask = new Uint8Array(totalPixels);
         let opaqueCount = 0;
         for (let px = 0, p = 0; px < totalPixels; px++, p += 4) {
-          if (rgba[p + 3] >= 64) {
+          if (rgba[p + 3] >= 32) {
             opaqueMask[px] = 1;
             opaqueCount++;
           }
@@ -1152,4 +1435,164 @@ export async function exportAnimationGif(
     height: cellH,
   };
 }
+
+export async function exportUrlAssetsAsZip(
+  zipFilename: string,
+  items: Array<{ zipPath: string; fetchUrl: string }>,
+  onProgress?: (done: number, total: number, phase: 'fetching' | 'zipping') => void
+): Promise<{ exported: number; failed: number }> {
+  if (items.length === 0) return { exported: 0, failed: 0 };
+
+  const results: StreamingZipEntry[] = [];
+  const usedPaths = new Set<string>();
+  let done = 0;
+  let failed = 0;
+  let cursor = 0;
+
+  const dedupePath = (rawPath: string) => {
+    if (!usedPaths.has(rawPath)) {
+      usedPaths.add(rawPath);
+      return rawPath;
+    }
+    const dot = rawPath.lastIndexOf('.');
+    const base = dot > 0 ? rawPath.slice(0, dot) : rawPath;
+    const ext = dot > 0 ? rawPath.slice(dot) : '';
+    let n = 2;
+    while (usedPaths.has(`${base}_${n}${ext}`)) n++;
+    const unique = `${base}_${n}${ext}`;
+    usedPaths.add(unique);
+    return unique;
+  };
+
+  const worker = async () => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      const item = items[idx];
+      let blob: Blob | null = null;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const resp = await fetch(item.fetchUrl, { signal: AbortSignal.timeout(20_000) });
+          if (resp.ok) {
+            blob = await resp.blob();
+            break;
+          }
+        } catch {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 350));
+          }
+        }
+      }
+
+      if (blob && blob.size > 0) {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        results.push({
+          path: dedupePath(item.zipPath),
+          blob,
+          size: bytes.byteLength,
+          crc32: computeCrc32(bytes),
+        });
+      } else {
+        failed++;
+      }
+
+      done++;
+      onProgress?.(done, items.length, 'fetching');
+    }
+  };
+
+  const concurrency = Math.min(6, items.length);
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  if (results.length === 0) {
+    throw new Error('Não foi possível baixar nenhum dos arquivos selecionados.');
+  }
+
+  results.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
+  onProgress?.(items.length, items.length, 'zipping');
+
+  const blob = await assembleStreamingZipBlob(
+    async function* (): AsyncGenerator<StreamingZipEntry[]> {
+      for (let i = 0; i < results.length; i += 24) {
+        yield results.slice(i, i + 24);
+      }
+    },
+    results.length
+  );
+
+  downloadBlob(blob, zipFilename);
+  return { exported: results.length, failed };
+}
+
+export async function sliceImageUrlToZip(
+  imageUrl: string,
+  zipFilename: string,
+  options?: {
+    folder?: string;
+    filePrefix?: string;
+    alphaThreshold?: number;
+    minSize?: number;
+    mergeGap?: number;
+  }
+): Promise<number> {
+  const img = await loadImageElement(imageUrl);
+  const sliced = sliceImageByAutoBBox(
+    img,
+    options?.alphaThreshold ?? 12,
+    options?.minSize ?? 12,
+    options?.mergeGap ?? 2
+  );
+  if (sliced.length === 0) {
+    throw new Error('Nenhum sprite/emoji isolado detectado na imagem.');
+  }
+
+  const folder = options?.folder ? `${options.folder.replace(/\/+$/, '')}/` : '';
+  const prefix = options?.filePrefix || 'sprite';
+
+  const entries: StreamingZipEntry[] = [];
+  const tempCanvas = document.createElement('canvas');
+  const tempCtx = tempCanvas.getContext('2d');
+  if (!tempCtx) throw new Error('Contexto 2D indisponível.');
+
+  for (let i = 0; i < sliced.length; i++) {
+    const f = sliced[i];
+    tempCanvas.width = f.sourceWidth;
+    tempCanvas.height = f.sourceHeight;
+    tempCtx.clearRect(0, 0, f.sourceWidth, f.sourceHeight);
+    tempCtx.drawImage(
+      img,
+      f.sourceX,
+      f.sourceY,
+      f.sourceWidth,
+      f.sourceHeight,
+      0,
+      0,
+      f.sourceWidth,
+      f.sourceHeight
+    );
+    const pngBlob = await canvasToPngBlob(tempCanvas);
+    if (pngBlob) {
+      const bytes = new Uint8Array(await pngBlob.arrayBuffer());
+      entries.push({
+        path: `${folder}${prefix}_${String(i + 1).padStart(3, '0')}.png`,
+        blob: pngBlob,
+        size: bytes.byteLength,
+        crc32: computeCrc32(bytes),
+      });
+    }
+  }
+
+  const zipBlob = await assembleStreamingZipBlob(
+    async function* (): AsyncGenerator<StreamingZipEntry[]> {
+      for (let i = 0; i < entries.length; i += 24) {
+        yield entries.slice(i, i + 24);
+      }
+    },
+    entries.length
+  );
+
+  downloadBlob(zipBlob, zipFilename);
+  return entries.length;
+}
+
 

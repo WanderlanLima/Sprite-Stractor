@@ -12,6 +12,7 @@ import {
 import type { NinjaEntry } from '../types/sprite';
 import {
   downloadBlob,
+  extractRegionToCanvas,
   extractRegionToPngBlob,
   loadImageElement,
   parseAtlas,
@@ -30,6 +31,15 @@ import {
   saveBatchJobRecord,
   saveNinjaFilesToStore,
 } from '../utils/batchDownloadStore';
+import {
+  buildCharacterInstructionsJson,
+  collectCharacterCompleteFiles,
+  collectCharacterEffectPlan,
+  fetchParsedEffectAsset,
+  sanitizePathSegment,
+  type EffectIncludeScope,
+  type ParsedEffectAsset,
+} from '../utils/completeCharacterExporter';
 import { fetchNinjaBundle } from '../utils/remoteClient';
 import { assembleStreamingZipBlob, streamZipToWritable } from '../utils/streamingZip';
 
@@ -139,17 +149,36 @@ async function fetchBufferWithRetry(
 
 const MODE_LABELS: Record<BatchContentMode, string> = {
   'idle-only': '1 Sprite Principal (PNG)',
-  'all-sliced': 'Todos os Frames Fatiados',
+  'all-sliced': 'Todos os Frames Fatiados (Pastas + PNGs)',
   'raw-bundle': 'Pacotes Originais (.webp + .atlas + .json)',
+  'complete-animated': 'Personagem Completo (Animações + Partículas + Originais)',
 };
+
+function getSpineFolderPrefix(ninja: NinjaEntry): string {
+  const kind =
+    ninja.kind ??
+    (ninja.id.toLowerCase().startsWith('vdfno_')
+      ? 'character'
+      : /(?:_effect|_highteffect|_ground)$/i.test(ninja.id) ||
+        ninja.id.toLowerCase().includes('huomiao')
+      ? 'effect'
+      : 'summon_skin');
+
+  if (kind === 'effect') return `efeitos/${ninja.id}`;
+  if (kind === 'summon_skin') return `invocacoes_skins/${ninja.id}`;
+  return `ninjas/${ninja.id}`;
+}
 
 export function BatchZipModal({
   isOpen,
   ninjas,
-  title = 'Baixar Sprites em Lote (ZIP)',
+  title = 'Exportar Catálogo Spine em Lote (ZIP)',
   onClose,
 }: BatchZipModalProps) {
   const [contentMode, setContentMode] = useState<BatchContentMode>('idle-only');
+  const [includeLinkedEffects, setIncludeLinkedEffects] = useState(true);
+  const [effectScope, setEffectScope] = useState<EffectIncludeScope>('powers');
+  const [includeAnimGifs, setIncludeAnimGifs] = useState(true);
   const [startIdx, setStartIdx] = useState(1);
   const [endIdx, setEndIdx] = useState(() => ninjas.length);
   const [chunkSize, setChunkSize] = useState<number>(100);
@@ -176,15 +205,23 @@ export function BatchZipModal({
 
   useEffect(() => {
     if (!isOpen) return;
-    if (ninjas.length > 0 && endIdx === 0) {
-      setEndIdx(ninjas.length);
-    }
+    setStartIdx(1);
+    setEndIdx(ninjas.length);
     let active = true;
     void getLatestBatchJob().then((job) => {
       if (!active || !job) return;
       setSavedJob(job);
       if (job.status === 'paused') {
         setContentMode(job.contentMode);
+        if (typeof job.includeLinkedEffects === 'boolean') {
+          setIncludeLinkedEffects(job.includeLinkedEffects);
+        }
+        if (job.effectScope) {
+          setEffectScope(job.effectScope);
+        }
+        if (typeof job.includeAnimGifs === 'boolean') {
+          setIncludeAnimGifs(job.includeAnimGifs);
+        }
         setStartIdx(job.startIdx);
         setEndIdx(job.endIdx);
         setChunkSize(job.chunkSize);
@@ -202,7 +239,7 @@ export function BatchZipModal({
     return () => {
       active = false;
     };
-  }, [isOpen, ninjas.length, endIdx]);
+  }, [isOpen, ninjas.length]);
 
   if (!isOpen) return null;
 
@@ -317,6 +354,18 @@ export function BatchZipModal({
 
   const runJob = async (existingJob?: BatchJobRecord) => {
     const activeMode = existingJob ? existingJob.contentMode : contentMode;
+    const activeIncludeEffects = existingJob
+      ? existingJob.includeLinkedEffects ?? true
+      : activeMode === 'idle-only'
+      ? false
+      : includeLinkedEffects;
+    const activeEffectScope: EffectIncludeScope = existingJob
+      ? existingJob.effectScope ?? 'powers'
+      : effectScope;
+    const activeIncludeGifs = existingJob
+      ? existingJob.includeAnimGifs ?? true
+      : includeAnimGifs;
+
     const activeStart = existingJob ? existingJob.startIdx : safeStart;
     const activeEnd = existingJob ? existingJob.endIdx : safeEnd;
     const activeChunk = existingJob ? existingJob.chunkSize : chunkSize;
@@ -342,6 +391,9 @@ export function BatchZipModal({
       ? { ...existingJob, status: 'running' }
       : await createBatchJob({
           contentMode: activeMode,
+          includeLinkedEffects: activeIncludeEffects,
+          effectScope: activeEffectScope,
+          includeAnimGifs: activeIncludeGifs,
           startIdx: activeStart,
           endIdx: activeEnd,
           chunkSize: activeChunk,
@@ -360,8 +412,11 @@ export function BatchZipModal({
     const effectiveChunk =
       activeChunk <= 0 ? activeList.length : Math.max(10, activeChunk);
     const totalParts = Math.ceil(activeList.length / effectiveChunk);
-    const workers = Math.max(1, Math.min(16, concurrency));
+    const requestedWorkers = Math.max(1, Math.min(16, concurrency));
+    const workers =
+      activeMode === 'complete-animated' ? Math.min(requestedWorkers, 2) : requestedWorkers;
 
+    const effectCache = new Map<string, Promise<ParsedEffectAsset | null>>();
     const startedAt = performance.now();
     const initialDone = completedSet.size;
     let sessionDone = 0;
@@ -427,13 +482,121 @@ export function BatchZipModal({
         if (controller.signal.aborted) return;
 
         const pages = parseAtlas(bundle.atlasText);
-        const rawItems: Array<{ path: string; data: Blob | ArrayBuffer | string }> = [];
+        const rawItems: Array<{ path: string; data: Blob | ArrayBuffer | Uint8Array | string }> = [];
+        const folderPrefix = getSpineFolderPrefix(ninja);
 
-        if (activeMode === 'raw-bundle') {
-          rawItems.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
+        const appendLinkedEffectsIfNeeded = async (sliceFrames: boolean) => {
+          if (!activeIncludeEffects || !bundle?.skeleton || activeEffectScope === 'base') return;
+          const plan = collectCharacterEffectPlan(bundle.skeleton, activeEffectScope);
+          const effectBundles = new Map<string, ParsedEffectAsset | null>();
+          const missing: string[] = [];
+
+          for (const spineId of plan.uniqueSpineIds) {
+            if (controller.signal.aborted) return;
+            const parsed = await fetchParsedEffectAsset(
+              ninja.atlasUrl,
+              spineId,
+              controller.signal,
+              effectCache
+            );
+            effectBundles.set(spineId, parsed);
+            if (!parsed) {
+              missing.push(spineId);
+              continue;
+            }
+            const effDir = `${folderPrefix}/particulas/${sanitizePathSegment(spineId)}`;
+            rawItems.push({ path: `${effDir}/${spineId}.atlas`, data: parsed.atlasText });
+            rawItems.push({
+              path: `${effDir}/${spineId}.json`,
+              data: JSON.stringify(parsed.skeleton, null, 2),
+            });
+            const effSheets = await Promise.all(
+              Object.entries(parsed.pageUrls).map(async ([pageName, proxyUrl]) => {
+                const buf = await fetchBufferWithRetry(proxyUrl, controller.signal, 2);
+                return { path: `${effDir}/${pageName}`, data: buf };
+              })
+            );
+            rawItems.push(...effSheets);
+
+            if (sliceFrames) {
+              for (const effPage of parsed.pages) {
+                const effImg = parsed.pageImages[effPage.name];
+                if (!effImg) continue;
+                const effBlobs = await Promise.all(
+                  effPage.regions.map(async (region) => {
+                    const frameName =
+                      region.index >= 0 ? `${region.name}_${region.index}` : region.name;
+                    const blob = await extractRegionToPngBlob(region, effImg);
+                    return blob
+                      ? { path: `${effDir}/frames/${sanitizePathSegment(frameName)}.png`, data: blob }
+                      : null;
+                  })
+                );
+                for (const item of effBlobs) {
+                  if (item) rawItems.push(item);
+                }
+              }
+            }
+          }
+
+          rawItems.push({
+            path: `${folderPrefix}/animacoes_instrucoes.json`,
+            data: buildCharacterInstructionsJson(
+              ninja.id,
+              bundle.skeleton,
+              activeEffectScope,
+              effectBundles,
+              missing
+            ),
+          });
+        };
+
+        if (activeMode === 'complete-animated') {
+          const pageImages: Record<string, HTMLImageElement> = {};
+          await Promise.all(
+            Object.entries(bundle.pageUrls).map(async ([pageName, proxyUrl]) => {
+              pageImages[pageName] = await loadImageWithRetry(proxyUrl, controller.signal, 3);
+            })
+          );
+          if (controller.signal.aborted) return;
+
+          const regionCanvasMap = new Map<string, HTMLCanvasElement>();
+          for (const page of pages) {
+            const img = pageImages[page.name];
+            if (!img) continue;
+            for (const reg of page.regions) {
+              regionCanvasMap.set(reg.name, extractRegionToCanvas(reg, img));
+            }
+          }
+
+          const completeFiles = await collectCharacterCompleteFiles(
+            {
+              ninja,
+              atlasText: bundle.atlasText,
+              skeleton: bundle.skeleton,
+              pageUrls: bundle.pageUrls,
+              pageImages,
+              regionCanvasMap,
+            },
+            {
+              effectScope: activeEffectScope,
+              includeOriginalAndFrames: true,
+              includeLinkedEffects: activeIncludeEffects,
+              includeAnimPngsAndSheets: true,
+              includeAnimGifs: activeIncludeGifs,
+              gifBg: 'transparent',
+              fps: 18,
+              folderPrefix,
+              signal: controller.signal,
+              effectCache,
+            }
+          );
+          rawItems.push(...completeFiles);
+        } else if (activeMode === 'raw-bundle') {
+          rawItems.push({ path: `${folderPrefix}/${ninja.id}.atlas`, data: bundle.atlasText });
           if (bundle.skeleton) {
             rawItems.push({
-              path: `${ninja.id}/${ninja.id}.json`,
+              path: `${folderPrefix}/${ninja.id}.json`,
               data: JSON.stringify(bundle.skeleton),
             });
           }
@@ -441,10 +604,11 @@ export function BatchZipModal({
           const downloadedSheets = await Promise.all(
             sheetEntries.map(async ([pageName, proxyUrl]) => {
               const buf = await fetchBufferWithRetry(proxyUrl, controller.signal, 3);
-              return { path: `${ninja.id}/${pageName}`, data: buf };
+              return { path: `${folderPrefix}/${pageName}`, data: buf };
             })
           );
           rawItems.push(...downloadedSheets);
+          await appendLinkedEffectsIfNeeded(false);
         } else {
           const pageImages: Record<string, HTMLImageElement> = {};
           await Promise.all(
@@ -457,24 +621,39 @@ export function BatchZipModal({
           if (activeMode === 'idle-only') {
             const allRegions = pages.flatMap((p) => p.regions);
             if (allRegions.length > 0) {
-              let targetRegionName = bundle.idleFrameName || allRegions[0].name;
-              if (!bundle.idleFrameName) {
-                const idleSlots = bundle.skeleton?.animations?.idle?.slots;
-                if (idleSlots) {
-                  const preferredSlot = idleSlots.L0 || Object.values(idleSlots)[0];
-                  const firstAtt = preferredSlot?.attachment?.find(
-                    (a) => typeof a.name === 'string'
-                  );
-                  if (firstAtt?.name) targetRegionName = firstAtt.name;
+              const largestRegion = allRegions.reduce(
+                (best, r) => (r.width * r.height > best.width * best.height ? r : best),
+                allRegions[0]
+              );
+              let targetRegionName = bundle.idleFrameName || largestRegion.name;
+              if (!bundle.idleFrameName && bundle.skeleton?.animations) {
+                const anims = bundle.skeleton.animations;
+                const animOrder = ['idle', 'stand', 'animation', 'skill', 'attack', ...Object.keys(anims)];
+                for (const animKey of animOrder) {
+                  const slots = anims[animKey]?.slots;
+                  if (!slots) continue;
+                  const slotOrder = [slots.L0, ...Object.values(slots)].filter(Boolean);
+                  let matched = false;
+                  for (const slotAnim of slotOrder) {
+                    const firstAtt = slotAnim?.attachment?.find(
+                      (a) => typeof a.name === 'string'
+                    );
+                    if (firstAtt?.name && allRegions.some((r) => r.name === firstAtt.name)) {
+                      targetRegionName = firstAtt.name;
+                      matched = true;
+                      break;
+                    }
+                  }
+                  if (matched) break;
                 }
               }
               const region =
-                allRegions.find((r) => r.name === targetRegionName) || allRegions[0];
+                allRegions.find((r) => r.name === targetRegionName) || largestRegion;
               const img = pageImages[region.pageName];
               if (img) {
                 const blob = await extractRegionToPngBlob(region, img);
                 if (blob) {
-                  rawItems.push({ path: `${ninja.id}.png`, data: blob });
+                  rawItems.push({ path: `${folderPrefix}.png`, data: blob });
                 }
               }
             }
@@ -487,20 +666,21 @@ export function BatchZipModal({
                   const frameName =
                     region.index >= 0 ? `${region.name}_${region.index}` : region.name;
                   const blob = await extractRegionToPngBlob(region, img);
-                  return blob ? { path: `${ninja.id}/${frameName}.png`, data: blob } : null;
+                  return blob ? { path: `${folderPrefix}/frames/${frameName}.png`, data: blob } : null;
                 })
               );
               for (const item of blobs) {
                 if (item) rawItems.push(item);
               }
             }
-            rawItems.push({ path: `${ninja.id}/${ninja.id}.atlas`, data: bundle.atlasText });
+            rawItems.push({ path: `${folderPrefix}/${ninja.id}.atlas`, data: bundle.atlasText });
             if (bundle.skeleton) {
               rawItems.push({
-                path: `${ninja.id}/${ninja.id}.json`,
+                path: `${folderPrefix}/${ninja.id}.json`,
                 data: JSON.stringify(bundle.skeleton),
               });
             }
+            await appendLinkedEffectsIfNeeded(true);
           }
         }
 
@@ -662,7 +842,7 @@ export function BatchZipModal({
               {title}
             </h3>
             <p className="mt-1 text-xs text-slate-400 tabular-nums">
-              {ninjas.length} ninjas disponíveis · Cache local retomável (IndexedDB) + ZIP Streaming
+              {ninjas.length} pacotes disponíveis · Cache local retomável (IndexedDB) + ZIP Streaming
             </p>
           </div>
           <button
@@ -686,10 +866,10 @@ export function BatchZipModal({
                   <span>Download em pausa salvo localmente</span>
                 </div>
                 <p className="text-[11px] text-slate-300">
-                  {MODE_LABELS[savedJob.contentMode]} · Ninjas {savedJob.startIdx}–{savedJob.endIdx}
+                  {MODE_LABELS[savedJob.contentMode]} · Pacotes {savedJob.startIdx}–{savedJob.endIdx}
                 </p>
                 <p className="text-[11px] font-mono text-amber-300 tabular-nums">
-                  {savedJob.completedIndices.length}/{savedJob.totalNinjas} ninjas salvos ·{' '}
+                  {savedJob.completedIndices.length}/{savedJob.totalNinjas} pacotes salvos ·{' '}
                   {formatBytesCompact(savedJob.totalBytes)} em cache
                 </p>
               </div>
@@ -746,7 +926,7 @@ export function BatchZipModal({
                   Pacote pronto no cache local
                 </div>
                 <p className="text-[11px] text-slate-300 tabular-nums">
-                  {MODE_LABELS[savedJob.contentMode]} · {savedJob.completedIndices.length} ninjas ·{' '}
+                  {MODE_LABELS[savedJob.contentMode]} · {savedJob.completedIndices.length} pacotes ·{' '}
                   {formatBytesCompact(savedJob.totalBytes)}
                 </p>
               </div>
@@ -790,18 +970,23 @@ export function BatchZipModal({
               [
                 {
                   id: 'idle-only',
-                  label: '1 Sprite Principal por Ninja (PNG)',
-                  desc: 'Rápido e leve — extrai a pose principal de cada ninja em PNG transparente.',
+                  label: '1 Sprite Principal por Pacote (PNG)',
+                  desc: 'Rápido e leve — extrai a pose principal de cada pacote em PNG transparente.',
                 },
                 {
                   id: 'all-sliced',
                   label: 'Todos os Frames Fatiados (Pastas + PNGs)',
-                  desc: 'Fatia todos os frames de cada ninja em pastas individuais (+ .atlas e .json).',
+                  desc: 'Fatia todos os frames de cada pacote em pastas (+ .atlas, .json e partículas opcionais).',
                 },
                 {
                   id: 'raw-bundle',
                   label: 'Pacotes Originais (.webp + .atlas + .json)',
-                  desc: 'Baixa as folhas de textura originais sem recortar os frames no navegador.',
+                  desc: 'Baixa as folhas de textura originais organizadas em pastas por categoria.',
+                },
+                {
+                  id: 'complete-animated',
+                  label: 'Personagem Completo (Animações + Partículas + Originais)',
+                  desc: 'Inclui originais, frames, partículas (noe_*), animacoes_instrucoes.json e todas as animações renderizadas juntas.',
                 },
               ] as const
             ).map((opt) => (
@@ -830,10 +1015,63 @@ export function BatchZipModal({
           </div>
         </div>
 
+        {contentMode !== 'idle-only' && (
+          <div className="space-y-2.5 rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs">
+            <label className="flex items-center gap-2 text-slate-200 cursor-pointer">
+              <input
+                type="checkbox"
+                disabled={running || packaging}
+                checked={includeLinkedEffects}
+                onChange={(e) => setIncludeLinkedEffects(e.target.checked)}
+                className="accent-orange-500"
+              />
+              <span>
+                Incluir pacotes de partículas vinculados (<code className="font-mono text-orange-300">particulas/noe_*</code>) e{' '}
+                <code className="font-mono text-orange-300">animacoes_instrucoes.json</code>
+              </span>
+            </label>
+
+            {(includeLinkedEffects || contentMode === 'complete-animated') && (
+              <div className="flex flex-wrap items-center justify-between gap-2 pl-5">
+                <span className="text-[11px] text-slate-400">Escopo das partículas:</span>
+                <select
+                  disabled={running || packaging}
+                  value={effectScope}
+                  onChange={(e) => setEffectScope(e.target.value as EffectIncludeScope)}
+                  aria-label="Escopo das partículas no lote"
+                  className="rounded border border-slate-800 bg-[#131A26] px-2 py-1 text-[11px] text-slate-200"
+                >
+                  <option value="powers">Com poderes (personagem + tela)</option>
+                  <option value="all">Completa (+ impactos no alvo)</option>
+                  <option value="base">Somente personagem (sem partículas)</option>
+                </select>
+              </div>
+            )}
+
+            {contentMode === 'complete-animated' && (
+              <>
+                <label className="flex items-center gap-2 pl-5 text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={running || packaging}
+                    checked={includeAnimGifs}
+                    onChange={(e) => setIncludeAnimGifs(e.target.checked)}
+                    className="accent-emerald-500"
+                  />
+                  <span>Gerar GIF animado para cada animação (além de PNGs e Spritesheet)</span>
+                </label>
+                <p className="pl-5 text-[11px] text-amber-300/90">
+                  Dica: o modo completo gera muitos arquivos e imagens — recomenda-se dividir o ZIP em 25 ou 50 pacotes.
+                </p>
+              </>
+            )}
+          </div>
+        )}
+
         {/* Range, Chunk Split & Speed */}
         <div className="grid grid-cols-2 gap-3 text-xs sm:grid-cols-4">
           <label className="space-y-1">
-            <span className="text-slate-400">Do ninja</span>
+            <span className="text-slate-400">Do item</span>
             <input
               type="number"
               min={1}
@@ -845,7 +1083,7 @@ export function BatchZipModal({
             />
           </label>
           <label className="space-y-1">
-            <span className="text-slate-400">Até o ninja</span>
+            <span className="text-slate-400">Até o item</span>
             <input
               type="number"
               min={1}
@@ -862,11 +1100,12 @@ export function BatchZipModal({
               disabled={running || packaging}
               value={chunkSize}
               onChange={(e) => setChunkSize(Number(e.target.value))}
-              className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-2 py-1.5 font-mono text-slate-100"
+              className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-2.5 py-1.5 font-mono text-slate-100"
             >
-              <option value={50}>50 ninjas</option>
-              <option value={100}>100 ninjas</option>
-              <option value={250}>250 ninjas</option>
+              <option value={25}>25 pacotes</option>
+              <option value={50}>50 pacotes</option>
+              <option value={100}>100 pacotes</option>
+              <option value={250}>250 pacotes</option>
               <option value={0}>Arquivo único</option>
             </select>
           </label>
@@ -946,7 +1185,7 @@ export function BatchZipModal({
                 <span>
                   {hasResumablePausedJob
                     ? `Novo Download (${targetList.length})`
-                    : `Baixar ${targetList.length} Ninjas (ZIP)`}
+                    : `Baixar ${targetList.length} Pacotes (ZIP)`}
                 </span>
               </button>
             </>

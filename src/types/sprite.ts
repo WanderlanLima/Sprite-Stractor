@@ -1,3 +1,5 @@
+export type SpinePackageKind = 'character' | 'summon_skin' | 'effect';
+
 export interface NinjaEntry {
   id: string;
   code: string;
@@ -7,6 +9,8 @@ export interface NinjaEntry {
   offsetY: number;
   atlasUrl: string;
   skeletonUrl: string;
+  kind?: SpinePackageKind;
+  sourceIndex?: 'spine-hd' | 'spine-astc' | 'code';
 }
 
 export interface SheetEntry {
@@ -15,12 +19,15 @@ export interface SheetEntry {
   width?: number;
   height?: number;
   bytes?: number;
+  sheetKind?: 'astc_sheet' | 'spine_sheet';
 }
+
+export type GameAssetCategory = 'emoji' | 'hero' | 'item' | 'ui' | 'bg' | 'sprite' | 'other';
 
 export interface GameAssetEntry {
   name: string;
   url: string;
-  category: 'ui' | 'item' | 'bg' | 'sprite' | 'other';
+  category: GameAssetCategory;
   ext: string;
 }
 
@@ -87,12 +94,15 @@ export interface SpineBoneDef {
   rotation?: number;
   scaleX?: number;
   scaleY?: number;
+  shearX?: number;
+  shearY?: number;
 }
 
 export interface SpineSlotDef {
   name: string;
   bone: string;
   attachment?: string;
+  color?: string;
   blend?: string;
 }
 
@@ -101,7 +111,7 @@ export interface SpineAnimationData {
     string,
     {
       attachment?: Array<{ time?: number; name?: string | null }>;
-      color?: Array<{ time?: number; color?: string }>;
+      color?: Array<{ time?: number; color?: string; curve?: unknown }>;
     }
   >;
   bones?: Record<
@@ -110,9 +120,31 @@ export interface SpineAnimationData {
       rotate?: Array<{ time?: number; angle?: number; curve?: unknown }>;
       translate?: Array<{ time?: number; x?: number; y?: number; curve?: unknown }>;
       scale?: Array<{ time?: number; x?: number; y?: number; curve?: unknown }>;
+      shear?: Array<{ time?: number; x?: number; y?: number; curve?: unknown }>;
     }
   >;
   events?: Array<{ time?: number; name?: string; string?: string }>;
+}
+
+export interface SpineCommandEffectRef {
+  spineId: string;
+  animName: string;
+  startTime: number;
+  layer: 'behind' | 'front';
+  isSelfOrScreen: boolean;
+  loop: boolean;
+  rawCommand: string;
+}
+
+export interface CompositeSpineLayer {
+  spineId: string;
+  skeleton: SpineSkeleton;
+  animName: string;
+  regionCanvasMap: Map<string, HTMLCanvasElement>;
+  startTime: number;
+  duration: number;
+  layer: 'behind' | 'front';
+  loop: boolean;
 }
 
 export interface SpineSkeleton {

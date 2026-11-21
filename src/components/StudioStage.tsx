@@ -14,34 +14,100 @@ import {
   Play,
   SkipBack,
   SkipForward,
+  X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import type {
   AtlasPage,
   AtlasRegion,
+  CompositeSpineLayer,
   NinjaEntry,
   SlicedFrame,
+  SpineCommandEffectRef,
   SpineSkeleton,
 } from '../types/sprite';
 import {
-  computeAnimationWorldBounds,
+  computeCompositeAnimationWorldBounds,
   downloadBlob,
   downloadDataUrl,
   exportAnimationGif,
   exportAnimationStripPng,
   exportFramesAsZip,
   extractRegionToCanvas,
+  extractSpineEffectRefs,
   getAnimationDuration,
+  getCompositeAnimationDuration,
   loadImageElement,
   parseAtlas,
   renderSpineFrameToCanvas,
   sliceAtlasRegions,
 } from '../utils/atlasParser';
+import {
+  buildCharacterInstructionsJson,
+  collectCharacterEffectPlan,
+  exportCompleteCharacterZip,
+  type EffectIncludeScope,
+} from '../utils/completeCharacterExporter';
 import { fetchNinjaBundle } from '../utils/remoteClient';
+
+interface LoadedEffectBundle {
+  skeleton: SpineSkeleton;
+  regionCanvasMap: Map<string, HTMLCanvasElement>;
+}
+
+const effectBundleCache = new Map<string, Promise<LoadedEffectBundle | null>>();
+
+function loadEffectBundle(baseAtlasUrl: string, spineId: string): Promise<LoadedEffectBundle | null> {
+  let atlasUrl: string;
+  let skeletonUrl: string;
+  try {
+    atlasUrl = new URL(`${spineId}.atlas`, baseAtlasUrl).toString();
+    skeletonUrl = new URL(`${spineId}.json`, baseAtlasUrl).toString();
+  } catch {
+    return Promise.resolve(null);
+  }
+
+  const cacheKey = atlasUrl;
+  const cached = effectBundleCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    try {
+      const data = await fetchNinjaBundle(atlasUrl, skeletonUrl);
+      if (!data.skeleton) return null;
+      const parsedPages = parseAtlas(data.atlasText);
+      const loadedImgs: Record<string, HTMLImageElement> = {};
+      await Promise.all(
+        Object.entries(data.pageUrls).map(async ([pageName, proxyUrl]) => {
+          loadedImgs[pageName] = await loadImageElement(proxyUrl);
+        })
+      );
+      const canvasMap = new Map<string, HTMLCanvasElement>();
+      for (const page of parsedPages) {
+        const img = loadedImgs[page.name];
+        if (!img) continue;
+        for (const reg of page.regions) {
+          canvasMap.set(reg.name, extractRegionToCanvas(reg, img));
+        }
+      }
+      return {
+        skeleton: data.skeleton,
+        regionCanvasMap: canvasMap,
+      };
+    } catch {
+      effectBundleCache.delete(cacheKey);
+      return null;
+    }
+  })();
+
+  effectBundleCache.set(cacheKey, promise);
+  return promise;
+}
 
 interface StudioStageProps {
   ninja: NinjaEntry | null;
+  openCompleteExportSignal?: number;
   onBackToCatalog: () => void;
   onLoadedFramesChange: (payload: {
     ninjaId: string;
@@ -69,6 +135,7 @@ const PRIORITY_ANIM_ORDER = [
 
 export function StudioStage({
   ninja,
+  openCompleteExportSignal = 0,
   onBackToCatalog,
   onLoadedFramesChange,
 }: StudioStageProps) {
@@ -105,8 +172,50 @@ export function StudioStage({
   const [gifProgress, setGifProgress] = useState<number | null>(null);
   const [gifBg, setGifBg] = useState<'transparent' | 'dark' | 'light' | 'chroma'>('transparent');
 
+  // Complete character export modal state
+  const [showCompleteExportModal, setShowCompleteExportModal] = useState(false);
+  const [completeEffectScope, setCompleteEffectScope] = useState<EffectIncludeScope>('powers');
+  const [completeIncludeOriginals, setCompleteIncludeOriginals] = useState(true);
+  const [completeIncludeEffects, setCompleteIncludeEffects] = useState(true);
+  const [completeIncludeAnimPngs, setCompleteIncludeAnimPngs] = useState(true);
+  const [completeIncludeAnimGifs, setCompleteIncludeAnimGifs] = useState(true);
+  const [completeGifBg, setCompleteGifBg] = useState<'transparent' | 'dark' | 'light' | 'chroma'>(
+    'transparent'
+  );
+  const [completeExportProgress, setCompleteExportProgress] = useState<{
+    phase: string;
+    message: string;
+    percent: number;
+  } | null>(null);
+  const [completeExportError, setCompleteExportError] = useState<string | null>(null);
+  const completeExportAbortRef = useRef<AbortController | null>(null);
+
+  const [effectMode, setEffectMode] = useState<'powers' | 'all' | 'base'>('powers');
+  const [compositeLayers, setCompositeLayers] = useState<CompositeSpineLayer[]>([]);
+  const [loadingEffects, setLoadingEffects] = useState(false);
+
+  const [playerDetached, setPlayerDetached] = useState(false);
+  const [dockHeight, setDockHeight] = useState(0);
+
   const playerCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const playerBoxRef = useRef<HTMLDivElement | null>(null);
+  const savedScrollYRef = useRef<number | null>(null);
   const animTimeRef = useRef(0);
+
+  const openDetachedPlayer = () => {
+    if (!playerDetached) {
+      savedScrollYRef.current = window.scrollY;
+      if (playerBoxRef.current) {
+        const h = playerBoxRef.current.getBoundingClientRect().height;
+        if (h > 0) setDockHeight(h);
+      }
+    }
+    setPlayerDetached(true);
+  };
+
+  const closeDetachedPlayer = () => {
+    setPlayerDetached(false);
+  };
 
   useEffect(() => {
     if (!ninja) {
@@ -115,12 +224,21 @@ export function StudioStage({
     }
 
     let cancelled = false;
+    window.scrollTo({ top: 0, behavior: 'auto' });
     setLoading(true);
     setError(null);
     setSelectedRegion(null);
     setCurrentTime(0);
     setZoom(1);
     setPan({ x: 0, y: 0 });
+    savedScrollYRef.current = null;
+    setDockHeight(0);
+    setPlayerDetached(false);
+    setShowCompleteExportModal(false);
+    setCompleteExportProgress(null);
+    setCompleteExportError(null);
+    setEffectMode('powers');
+    setCompositeLayers([]);
     animTimeRef.current = 0;
 
     async function loadBundle() {
@@ -149,7 +267,9 @@ export function StudioStage({
         }
 
         const availableAnims = Object.keys(data.skeleton?.animations || {});
+        const idleAnim = availableAnims.find((a) => a.toLowerCase() === 'idle');
         const defaultAnim =
+          idleAnim ||
           PRIORITY_ANIM_ORDER.find((a) => availableAnims.includes(a)) ||
           availableAnims[0] ||
           '';
@@ -161,8 +281,15 @@ export function StudioStage({
         setSkeleton(data.skeleton);
         setFrames(sliced);
         setRegionCanvasMap(canvasMap);
-        if (defaultAnim) setSelectedAnim(defaultAnim);
-        else setStageMode('frames');
+        if (defaultAnim) {
+          setSelectedAnim(defaultAnim);
+          setStageMode('player');
+          setIsPlaying(true);
+          setCurrentTime(0);
+          animTimeRef.current = 0;
+        } else {
+          setStageMode('frames');
+        }
 
         onLoadedFramesChange({
           ninjaId: ninja.id,
@@ -189,6 +316,10 @@ export function StudioStage({
   const animNames = useMemo(() => {
     const raw = Object.keys(skeleton?.animations || {});
     return raw.sort((a, b) => {
+      const aIdle = a.toLowerCase() === 'idle';
+      const bIdle = b.toLowerCase() === 'idle';
+      if (aIdle && !bIdle) return -1;
+      if (!aIdle && bIdle) return 1;
       const ia = PRIORITY_ANIM_ORDER.indexOf(a);
       const ib = PRIORITY_ANIM_ORDER.indexOf(b);
       if (ia !== -1 && ib !== -1) return ia - ib;
@@ -197,6 +328,142 @@ export function StudioStage({
       return a.localeCompare(b);
     });
   }, [skeleton]);
+
+  // Exit detached overlay if user leaves player mode
+  useEffect(() => {
+    if (stageMode !== 'player') {
+      setPlayerDetached(false);
+    }
+  }, [stageMode]);
+
+  // Lock background scroll, allow Escape key to dismiss, and restore scrollY on close
+  useEffect(() => {
+    if (!playerDetached) {
+      const targetY = savedScrollYRef.current;
+      if (targetY !== null) {
+        savedScrollYRef.current = null;
+        window.scrollTo({ top: targetY, behavior: 'auto' });
+        const rafId = requestAnimationFrame(() => {
+          window.scrollTo({ top: targetY, behavior: 'auto' });
+        });
+        return () => cancelAnimationFrame(rafId);
+      }
+      return;
+    }
+
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        closeDetachedPlayer();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [playerDetached]);
+
+  useEffect(() => {
+    if (openCompleteExportSignal > 0 && ninja && !loading && !error) {
+      setShowCompleteExportModal(true);
+    }
+  }, [openCompleteExportSignal, ninja, loading, error]);
+
+  const completeEffectPlan = useMemo(
+    () => collectCharacterEffectPlan(skeleton, completeEffectScope),
+    [skeleton, completeEffectScope]
+  );
+
+  const animEffectMap = useMemo(() => {
+    const map = new Map<string, SpineCommandEffectRef[]>();
+    if (!skeleton) return map;
+    for (const animName of animNames) {
+      map.set(animName, extractSpineEffectRefs(skeleton, animName));
+    }
+    return map;
+  }, [skeleton, animNames]);
+
+  const rawEffectRefs = useMemo(
+    () => animEffectMap.get(selectedAnim) || [],
+    [animEffectMap, selectedAnim]
+  );
+
+  const hasSelfPowers = useMemo(
+    () => rawEffectRefs.some((r) => r.isSelfOrScreen),
+    [rawEffectRefs]
+  );
+  const hasImpactEffects = useMemo(
+    () => rawEffectRefs.some((r) => !r.isSelfOrScreen),
+    [rawEffectRefs]
+  );
+
+  // Load companion Spine power/particle bundles for the selected animation
+  useEffect(() => {
+    if (!ninja || !skeleton || !selectedAnim || effectMode === 'base' || rawEffectRefs.length === 0) {
+      setCompositeLayers([]);
+      setLoadingEffects(false);
+      return;
+    }
+
+    const activeRefs =
+      effectMode === 'all'
+        ? rawEffectRefs
+        : rawEffectRefs.filter((r) => r.isSelfOrScreen);
+
+    if (activeRefs.length === 0) {
+      setCompositeLayers([]);
+      setLoadingEffects(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLoadingEffects(true);
+
+    const uniqueSpineIds = Array.from(new Set(activeRefs.map((r) => r.spineId)));
+    Promise.all(
+      uniqueSpineIds.map(async (id) => [id, await loadEffectBundle(ninja.atlasUrl, id)] as const)
+    )
+      .then((entries) => {
+        if (cancelled) return;
+        const bundleMap = new Map<string, LoadedEffectBundle>();
+        for (const [id, bundle] of entries) {
+          if (bundle) bundleMap.set(id, bundle);
+        }
+
+        const builtLayers: CompositeSpineLayer[] = [];
+        for (const ref of activeRefs) {
+          const bundle = bundleMap.get(ref.spineId);
+          if (!bundle) continue;
+          const available = Object.keys(bundle.skeleton.animations || {});
+          const targetAnim =
+            available.find((a) => a === ref.animName) ||
+            available.find((a) => a.toLowerCase() === ref.animName.toLowerCase()) ||
+            available[0];
+          if (!targetAnim) continue;
+
+          builtLayers.push({
+            spineId: ref.spineId,
+            skeleton: bundle.skeleton,
+            animName: targetAnim,
+            regionCanvasMap: bundle.regionCanvasMap,
+            startTime: ref.startTime,
+            duration: getAnimationDuration(bundle.skeleton, targetAnim),
+            layer: ref.layer,
+            loop: ref.loop,
+          });
+        }
+        setCompositeLayers(builtLayers);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingEffects(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [ninja, skeleton, selectedAnim, effectMode, rawEffectRefs]);
 
   const filteredAnimNames = useMemo(() => {
     const q = animFilter.trim().toLowerCase();
@@ -208,15 +475,26 @@ export function StudioStage({
     return q ? frames.filter((f) => f.name.toLowerCase().includes(q)) : frames;
   }, [frames, frameFilter]);
 
-  const duration = useMemo(() => {
+  const baseDuration = useMemo(() => {
     if (!skeleton || !selectedAnim) return 0;
     return getAnimationDuration(skeleton, selectedAnim);
   }, [skeleton, selectedAnim]);
 
+  const duration = useMemo(
+    () => getCompositeAnimationDuration(baseDuration, compositeLayers),
+    [baseDuration, compositeLayers]
+  );
+
   const animWorldBounds = useMemo(() => {
     if (!skeleton || !selectedAnim || regionCanvasMap.size === 0) return null;
-    return computeAnimationWorldBounds(skeleton, selectedAnim, regionCanvasMap, 24);
-  }, [skeleton, selectedAnim, regionCanvasMap]);
+    return computeCompositeAnimationWorldBounds(
+      skeleton,
+      selectedAnim,
+      regionCanvasMap,
+      compositeLayers,
+      24
+    );
+  }, [skeleton, selectedAnim, regionCanvasMap, compositeLayers]);
 
   // Reset framing cleanly when switching animations if autoFit is active
   useEffect(() => {
@@ -251,7 +529,8 @@ export function StudioStage({
         zoom,
         pan.x,
         pan.y,
-        autoFit ? animWorldBounds : null
+        autoFit ? animWorldBounds : null,
+        compositeLayers
       );
     };
 
@@ -279,6 +558,7 @@ export function StudioStage({
     skeleton,
     selectedAnim,
     regionCanvasMap,
+    compositeLayers,
     isPlaying,
     speed,
     duration,
@@ -307,7 +587,8 @@ export function StudioStage({
         zoom,
         pan.x,
         pan.y,
-        autoFit ? animWorldBounds : null
+        autoFit ? animWorldBounds : null,
+        compositeLayers
       );
     }
   }, [
@@ -317,6 +598,7 @@ export function StudioStage({
     skeleton,
     selectedAnim,
     regionCanvasMap,
+    compositeLayers,
     zoom,
     pan,
     autoFit,
@@ -343,8 +625,15 @@ export function StudioStage({
 
   const handleExportAnimStrip = () => {
     if (!skeleton || !selectedAnim || !ninja) return;
-    const res = exportAnimationStripPng(skeleton, selectedAnim, regionCanvasMap, 16);
-    downloadDataUrl(res.dataUrl, `${ninja.id}_${selectedAnim}_strip_${res.frameCount}f.png`);
+    const res = exportAnimationStripPng(
+      skeleton,
+      selectedAnim,
+      regionCanvasMap,
+      16,
+      compositeLayers
+    );
+    const suffix = compositeLayers.length > 0 ? '_com_poderes' : '';
+    downloadDataUrl(res.dataUrl, `${ninja.id}_${selectedAnim}${suffix}_strip_${res.frameCount}f.png`);
   };
 
   const handleExportAnimZip = async () => {
@@ -355,7 +644,13 @@ export function StudioStage({
       const count = Math.max(1, Math.min(72, Math.round(duration * fps)));
       const bounds =
         animWorldBounds ||
-        computeAnimationWorldBounds(skeleton, selectedAnim, regionCanvasMap, 24);
+        computeCompositeAnimationWorldBounds(
+          skeleton,
+          selectedAnim,
+          regionCanvasMap,
+          compositeLayers,
+          24
+        );
       const cellW = Math.max(160, Math.min(640, Math.ceil(bounds.width * 1.16)));
       const cellH = Math.max(160, Math.min(640, Math.ceil(bounds.height * 1.16)));
       const offCanvas = document.createElement('canvas');
@@ -378,7 +673,8 @@ export function StudioStage({
             1,
             0,
             0,
-            bounds
+            bounds,
+            compositeLayers
           );
           animFrames.push({
             id: `${selectedAnim}_${i}`,
@@ -395,9 +691,80 @@ export function StudioStage({
         }
       }
 
-      await exportFramesAsZip(`${ninja.id}_${selectedAnim}.zip`, animFrames);
+      const suffix = compositeLayers.length > 0 ? '_com_poderes' : '';
+      const rawRefsForAnim = extractSpineEffectRefs(skeleton, selectedAnim);
+      const animInstructions = JSON.stringify(
+        {
+          characterId: ninja.id,
+          animation: selectedAnim,
+          durationSec: Number(duration.toFixed(4)),
+          fps,
+          frameCount: animFrames.length,
+          effectMode,
+          effects: rawRefsForAnim.map((r) => ({
+            spineId: r.spineId,
+            effectAnim: r.animName,
+            startTimeSec: Number(r.startTime.toFixed(4)),
+            layer: r.layer,
+            isSelfOrScreen: r.isSelfOrScreen,
+            loop: r.loop,
+            rawCommand: r.rawCommand,
+          })),
+        },
+        null,
+        2
+      );
+      await exportFramesAsZip(`${ninja.id}_${selectedAnim}${suffix}.zip`, animFrames, {
+        extraFiles: [{ path: 'instrucoes_animacao.json', data: animInstructions }],
+      });
     } finally {
       setExportingAnim(false);
+    }
+  };
+
+  const handleRunCompleteCharacterExport = async () => {
+    if (!ninja) return;
+    const controller = new AbortController();
+    completeExportAbortRef.current = controller;
+    setCompleteExportError(null);
+    setCompleteExportProgress({
+      phase: 'base',
+      message: 'Iniciando empacotamento completo...',
+      percent: 2,
+    });
+
+    try {
+      await exportCompleteCharacterZip(
+        {
+          ninja,
+          atlasText,
+          skeleton,
+          pageUrls,
+          pageImages,
+          regionCanvasMap,
+        },
+        {
+          effectScope: completeEffectScope,
+          includeOriginalAndFrames: completeIncludeOriginals,
+          includeLinkedEffects: completeIncludeEffects,
+          includeAnimPngsAndSheets: completeIncludeAnimPngs,
+          includeAnimGifs: completeIncludeAnimGifs,
+          gifBg: completeGifBg,
+          fps: 18,
+          signal: controller.signal,
+          onProgress: (info) => setCompleteExportProgress(info),
+        }
+      );
+      setShowCompleteExportModal(false);
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === 'AbortError')) {
+        setCompleteExportError(
+          err instanceof Error ? err.message : 'Erro ao exportar personagem completo.'
+        );
+      }
+    } finally {
+      completeExportAbortRef.current = null;
+      setCompleteExportProgress(null);
     }
   };
 
@@ -417,10 +784,12 @@ export function StudioStage({
         fps: 18,
         bounds: animWorldBounds,
         backgroundColor,
+        compositeLayers,
         onProgress: (pct) => setGifProgress(pct),
       });
+      const powerSuffix = compositeLayers.length > 0 ? '_poderes' : '';
       const bgSuffix = gifBg === 'transparent' ? '_sem_fundo' : `_${gifBg}`;
-      downloadBlob(res.blob, `${ninja.id}_${selectedAnim}${bgSuffix}.gif`);
+      downloadBlob(res.blob, `${ninja.id}_${selectedAnim}${powerSuffix}${bgSuffix}.gif`);
     } finally {
       setGifProgress(null);
     }
@@ -469,44 +838,56 @@ export function StudioStage({
           </div>
         </div>
 
-        {/* Mode Switcher */}
-        <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] p-1">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Mode Switcher */}
+          <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] p-1">
+            <button
+              type="button"
+              onClick={() => setStageMode('player')}
+              disabled={animNames.length === 0}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-40 ${
+                stageMode === 'player'
+                  ? 'bg-orange-600 text-white'
+                  : 'text-slate-400 hover:text-slate-100'
+              }`}
+            >
+              <Film className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Animações</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setStageMode('frames')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                stageMode === 'frames'
+                  ? 'bg-orange-600 text-white'
+                  : 'text-slate-400 hover:text-slate-100'
+              }`}
+            >
+              <Grid className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Frames Fatiados ({frames.length})</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setStageMode('sheet')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                stageMode === 'sheet'
+                  ? 'bg-orange-600 text-white'
+                  : 'text-slate-400 hover:text-slate-100'
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Folha Original</span>
+            </button>
+          </div>
+
           <button
             type="button"
-            onClick={() => setStageMode('player')}
-            disabled={animNames.length === 0}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-40 ${
-              stageMode === 'player'
-                ? 'bg-orange-600 text-white'
-                : 'text-slate-400 hover:text-slate-100'
-            }`}
+            disabled={loading || Boolean(error)}
+            onClick={() => setShowCompleteExportModal(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 cursor-pointer whitespace-nowrap"
           >
-            <Film className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>Animações</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setStageMode('frames')}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
-              stageMode === 'frames'
-                ? 'bg-orange-600 text-white'
-                : 'text-slate-400 hover:text-slate-100'
-            }`}
-          >
-            <Grid className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>Frames Fatiados ({frames.length})</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setStageMode('sheet')}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
-              stageMode === 'sheet'
-                ? 'bg-orange-600 text-white'
-                : 'text-slate-400 hover:text-slate-100'
-            }`}
-          >
-            <Layers className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>Folha Original</span>
+            <Download className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Baixar Completo (ZIP)</span>
           </button>
         </div>
       </div>
@@ -539,156 +920,288 @@ export function StudioStage({
           {/* Main Stage */}
           <div className="min-w-0 space-y-4">
             {stageMode === 'player' && (
-              <div className="overflow-hidden rounded-lg border border-slate-800 bg-[#131A26]">
-                {/* Canvas Toolbar */}
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 px-4 py-2.5">
-                  <div className="flex items-center gap-1.5">
-                    {(
-                      [
-                        { id: 'checker', label: 'Xadrez' },
-                        { id: 'dark', label: 'Escuro' },
-                        { id: 'light', label: 'Claro' },
-                        { id: 'chroma', label: 'Chroma' },
-                      ] as const
-                    ).map((bg) => (
-                      <button
-                        key={bg.id}
-                        type="button"
-                        onClick={() => setBgStyle(bg.id)}
-                        className={`rounded px-2.5 py-1 text-xs font-medium transition-colors cursor-pointer ${
-                          bgStyle === bg.id
-                            ? 'bg-slate-700 text-white'
-                            : 'text-slate-400 hover:text-slate-200'
-                        }`}
-                      >
-                        {bg.label}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="flex items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] p-0.5">
-                      <button
-                        type="button"
-                        onClick={() => setPan((p) => ({ ...p, x: p.x - 24 }))}
-                        aria-label="Mover para esquerda"
-                        title="Mover esquerda"
-                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
-                      >
-                        <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setPan((p) => ({ ...p, y: p.y - 24 }))}
-                        aria-label="Mover para cima"
-                        title="Mover cima"
-                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
-                      >
-                        <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setPan((p) => ({ ...p, y: p.y + 24 }))}
-                        aria-label="Mover para baixo"
-                        title="Mover baixo"
-                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
-                      >
-                        <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setPan((p) => ({ ...p, x: p.x + 24 }))}
-                        aria-label="Mover para direita"
-                        title="Mover direita"
-                        className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
-                      >
-                        <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
-                      </button>
-                    </div>
-
+              <div
+                style={
+                  playerDetached && dockHeight > 0
+                    ? { minHeight: `${dockHeight}px` }
+                    : undefined
+                }
+              >
+                {playerDetached && (
+                  <div className="flex items-center justify-between rounded-lg border border-dashed border-slate-700/80 bg-[#131A26]/50 px-4 py-6 text-xs text-slate-400">
+                    <span>Player exibido em tela cheia · Animação: {selectedAnim}</span>
                     <button
                       type="button"
-                      onClick={() => {
-                        setAutoFit(true);
-                        setZoom(1);
-                        setPan({ x: 0, y: 0 });
-                      }}
-                      title="Enquadrar animação inteira na tela"
-                      className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-xs font-medium cursor-pointer transition-colors ${
-                        autoFit && zoom === 1 && pan.x === 0 && pan.y === 0
-                          ? 'border-orange-500/60 bg-orange-950/30 text-orange-200'
-                          : 'border-slate-800 bg-[#0B0F17] text-slate-300 hover:border-slate-600'
+                      onClick={closeDetachedPlayer}
+                      className="rounded-md border border-slate-700 bg-[#0B0F17] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-orange-500 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      Recolher aqui
+                    </button>
+                  </div>
+                )}
+
+                <div
+                  className={
+                    playerDetached
+                      ? 'fixed inset-0 z-50 overflow-y-auto bg-[#0B0F17]/95 backdrop-blur-md p-3 sm:p-6'
+                      : ''
+                  }
+                  onClick={
+                    playerDetached
+                      ? (e) => {
+                          if (e.target === e.currentTarget) {
+                            closeDetachedPlayer();
+                          }
+                        }
+                      : undefined
+                  }
+                  role={playerDetached ? 'dialog' : undefined}
+                  aria-modal={playerDetached ? true : undefined}
+                  aria-label={playerDetached ? `Player de animação ${ninja.id}` : undefined}
+                >
+                  <div
+                    ref={!playerDetached ? playerBoxRef : undefined}
+                    className={`rounded-lg border border-slate-800 bg-[#131A26] ${
+                      playerDetached
+                        ? 'mx-auto my-2 w-full max-w-6xl border-slate-700/80 shadow-2xl'
+                        : 'overflow-hidden'
+                    }`}
+                  >
+                    {playerDetached && (
+                      <div className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-t-lg border-b border-slate-800/80 bg-[#0F1520] px-4 py-2.5">
+                        <div className="flex min-w-0 items-center gap-2 text-xs">
+                          <span className="truncate font-mono font-semibold text-slate-100">
+                            {ninja.id}
+                          </span>
+                          <span className="text-slate-500" aria-hidden="true">
+                            ·
+                          </span>
+                          <span className="truncate font-mono font-medium text-orange-400">
+                            {selectedAnim}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={closeDetachedPlayer}
+                          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#131A26] px-4 py-2 text-xs font-semibold text-slate-100 hover:border-orange-500 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          <X className="h-4 w-4" aria-hidden="true" />
+                          <span>Fechar</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Canvas Toolbar */}
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 px-4 py-2.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex items-center gap-1.5">
+                          {(
+                            [
+                              { id: 'checker', label: 'Xadrez' },
+                              { id: 'dark', label: 'Escuro' },
+                              { id: 'light', label: 'Claro' },
+                              { id: 'chroma', label: 'Chroma' },
+                            ] as const
+                          ).map((bg) => (
+                            <button
+                              key={bg.id}
+                              type="button"
+                              onClick={() => setBgStyle(bg.id)}
+                              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                bgStyle === bg.id
+                                  ? 'bg-slate-700 text-white'
+                                  : 'text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              {bg.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        {rawEffectRefs.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] p-0.5">
+                            {hasSelfPowers && (
+                              <button
+                                type="button"
+                                onClick={() => setEffectMode('powers')}
+                                className={`rounded px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                  effectMode === 'powers'
+                                    ? 'bg-orange-600 text-white'
+                                    : 'text-slate-400 hover:text-slate-100'
+                                }`}
+                              >
+                                Com poderes
+                              </button>
+                            )}
+                            {hasImpactEffects && (
+                              <button
+                                type="button"
+                                onClick={() => setEffectMode('all')}
+                                className={`rounded px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                  effectMode === 'all'
+                                    ? 'bg-orange-600 text-white'
+                                    : 'text-slate-400 hover:text-slate-100'
+                                }`}
+                              >
+                                {hasSelfPowers ? 'Completa (+ impactos)' : 'Com efeitos'}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setEffectMode('base')}
+                              className={`rounded px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                                effectMode === 'base'
+                                  ? 'bg-slate-700 text-white'
+                                  : 'text-slate-400 hover:text-slate-100'
+                              }`}
+                            >
+                              Somente ninja
+                            </button>
+                          </div>
+                        )}
+
+                        {loadingEffects && (
+                          <span className="text-xs text-orange-300 font-mono whitespace-nowrap">
+                            Carregando poderes...
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setPan((p) => ({ ...p, x: p.x - 24 }))}
+                            aria-label="Mover para esquerda"
+                            title="Mover esquerda"
+                            className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                          >
+                            <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPan((p) => ({ ...p, y: p.y - 24 }))}
+                            aria-label="Mover para cima"
+                            title="Mover cima"
+                            className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                          >
+                            <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPan((p) => ({ ...p, y: p.y + 24 }))}
+                            aria-label="Mover para baixo"
+                            title="Mover baixo"
+                            className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                          >
+                            <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPan((p) => ({ ...p, x: p.x + 24 }))}
+                            aria-label="Mover para direita"
+                            title="Mover direita"
+                            className="rounded p-1 text-slate-300 hover:bg-slate-800 cursor-pointer"
+                          >
+                            <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+                          </button>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAutoFit(true);
+                            setZoom(1);
+                            setPan({ x: 0, y: 0 });
+                          }}
+                          title="Enquadrar animação inteira na tela"
+                          className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                            autoFit && zoom === 1 && pan.x === 0 && pan.y === 0
+                              ? 'border-orange-500/60 bg-orange-950/30 text-orange-200'
+                              : 'border-slate-800 bg-[#0B0F17] text-slate-300 hover:border-slate-600'
+                          }`}
+                        >
+                          <Maximize2 className="h-3 w-3" aria-hidden="true" />
+                          <span>Enquadrar</span>
+                        </button>
+
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setZoom((z) => Math.max(0.2, Number((z - 0.15).toFixed(2))))
+                            }
+                            aria-label="Diminuir zoom"
+                            className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
+                          >
+                            <ZoomOut className="h-3.5 w-3.5" aria-hidden="true" />
+                          </button>
+                          <span className="w-11 text-center font-mono text-xs text-slate-300 tabular-nums">
+                            {Math.round(zoom * 100)}%
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setZoom((z) => Math.min(6, Number((z + 0.15).toFixed(2))))
+                            }
+                            aria-label="Aumentar zoom"
+                            className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
+                          >
+                            <ZoomIn className="h-3.5 w-3.5" aria-hidden="true" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Stage Canvas (supports touch/mouse drag to pan) */}
+                    <div
+                      className={`${bgClass} relative flex items-center justify-center p-4 ${
+                        playerDetached ? 'h-[48vh] min-h-[260px] max-h-[520px]' : ''
                       }`}
                     >
-                      <Maximize2 className="h-3 w-3" aria-hidden="true" />
-                      <span>Enquadrar</span>
-                    </button>
-
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setZoom((z) => Math.max(0.2, Number((z - 0.15).toFixed(2))))}
-                        aria-label="Diminuir zoom"
-                        className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
-                      >
-                        <ZoomOut className="h-3.5 w-3.5" aria-hidden="true" />
-                      </button>
-                      <span className="w-11 text-center font-mono text-xs text-slate-300 tabular-nums">
-                        {Math.round(zoom * 100)}%
+                      <canvas
+                        ref={playerCanvasRef}
+                        width={640}
+                        height={420}
+                        onPointerDown={(e) => {
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          dragStartRef.current = {
+                            x: e.clientX,
+                            y: e.clientY,
+                            panX: pan.x,
+                            panY: pan.y,
+                          };
+                        }}
+                        onPointerMove={(e) => {
+                          const d = dragStartRef.current;
+                          if (!d) return;
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          const scaleX = e.currentTarget.width / Math.max(1, rect.width);
+                          const scaleY = e.currentTarget.height / Math.max(1, rect.height);
+                          setPan({
+                            x: Math.round(d.panX + (e.clientX - d.x) * scaleX),
+                            y: Math.round(d.panY + (e.clientY - d.y) * scaleY),
+                          });
+                        }}
+                        onPointerUp={(e) => {
+                          dragStartRef.current = null;
+                          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                            e.currentTarget.releasePointerCapture(e.pointerId);
+                          }
+                        }}
+                        onPointerCancel={() => {
+                          dragStartRef.current = null;
+                        }}
+                        className={
+                          playerDetached
+                            ? 'h-full w-full max-w-5xl object-contain touch-none cursor-grab active:cursor-grabbing'
+                            : 'max-h-[420px] w-full max-w-[640px] object-contain touch-none cursor-grab active:cursor-grabbing'
+                        }
+                      />
+                      <span className="pointer-events-none absolute bottom-2 right-3 rounded bg-black/55 px-2 py-0.5 text-[10px] font-mono text-slate-300">
+                        Arraste para mover · Enquadramento automático ativo
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => setZoom((z) => Math.min(3, Number((z + 0.15).toFixed(2))))}
-                        aria-label="Aumentar zoom"
-                        className="rounded border border-slate-800 bg-[#0B0F17] p-1.5 text-slate-300 hover:border-slate-600 cursor-pointer"
-                      >
-                        <ZoomIn className="h-3.5 w-3.5" aria-hidden="true" />
-                      </button>
                     </div>
-                  </div>
-                </div>
-
-                {/* Stage Canvas (supports touch/mouse drag to pan) */}
-                <div className={`${bgClass} relative flex items-center justify-center p-4`}>
-                  <canvas
-                    ref={playerCanvasRef}
-                    width={640}
-                    height={420}
-                    onPointerDown={(e) => {
-                      e.currentTarget.setPointerCapture(e.pointerId);
-                      dragStartRef.current = {
-                        x: e.clientX,
-                        y: e.clientY,
-                        panX: pan.x,
-                        panY: pan.y,
-                      };
-                    }}
-                    onPointerMove={(e) => {
-                      const d = dragStartRef.current;
-                      if (!d) return;
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const scaleX = e.currentTarget.width / Math.max(1, rect.width);
-                      const scaleY = e.currentTarget.height / Math.max(1, rect.height);
-                      setPan({
-                        x: Math.round(d.panX + (e.clientX - d.x) * scaleX),
-                        y: Math.round(d.panY + (e.clientY - d.y) * scaleY),
-                      });
-                    }}
-                    onPointerUp={(e) => {
-                      dragStartRef.current = null;
-                      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-                        e.currentTarget.releasePointerCapture(e.pointerId);
-                      }
-                    }}
-                    onPointerCancel={() => {
-                      dragStartRef.current = null;
-                    }}
-                    className="max-h-[420px] w-full max-w-[640px] object-contain touch-none cursor-grab active:cursor-grabbing"
-                  />
-                  <span className="pointer-events-none absolute bottom-2 right-3 rounded bg-black/55 px-2 py-0.5 text-[10px] font-mono text-slate-300">
-                    Arraste para mover · Enquadramento automático ativo
-                  </span>
-                </div>
 
                 {/* Playback & Export Controls */}
                 <div className="space-y-3 border-t border-slate-800/80 p-4">
@@ -838,6 +1351,8 @@ export function StudioStage({
                     </button>
                   </div>
                 </div>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -851,21 +1366,43 @@ export function StudioStage({
                     placeholder="Filtrar frame (ex: a33, a0)..."
                     className="w-60 rounded-lg border border-slate-800 bg-[#0B0F17] px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
                   />
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void exportFramesAsZip(`${ninja.id}_todos_frames.zip`, frames, {
-                        atlasText,
-                        atlasName: `${ninja.id}.atlas`,
-                        skeletonJson: skeleton,
-                        skeletonName: `${ninja.id}.json`,
-                      })
-                    }
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-orange-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-orange-500 cursor-pointer"
-                  >
-                    <Download className="h-3.5 w-3.5" aria-hidden="true" />
-                    <span>Baixar Todos os {frames.length} Frames (ZIP)</span>
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCompleteExportModal(true)}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-500 cursor-pointer"
+                    >
+                      <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>Personagem Completo + Animações (ZIP)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void exportFramesAsZip(`${ninja.id}_todos_frames.zip`, frames, {
+                          atlasText,
+                          atlasName: `${ninja.id}.atlas`,
+                          skeletonJson: skeleton,
+                          skeletonName: `${ninja.id}.json`,
+                          extraFiles: skeleton
+                            ? [
+                                {
+                                  path: 'animacoes_instrucoes.json',
+                                  data: buildCharacterInstructionsJson(
+                                    ninja.id,
+                                    skeleton,
+                                    'all'
+                                  ),
+                                },
+                              ]
+                            : undefined,
+                        })
+                      }
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-orange-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-orange-500 cursor-pointer"
+                    >
+                      <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>Baixar Só Frames Base ({frames.length})</span>
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5">
@@ -1063,6 +1600,9 @@ export function StudioStage({
                   {filteredAnimNames.map((anim) => {
                     const active = anim === selectedAnim && stageMode === 'player';
                     const dur = skeleton ? getAnimationDuration(skeleton, anim) : 0;
+                    const effRefs = animEffectMap.get(anim) || [];
+                    const hasPowers = effRefs.some((r) => r.isSelfOrScreen);
+                    const hasImpacts = !hasPowers && effRefs.length > 0;
                     return (
                       <button
                         key={anim}
@@ -1073,6 +1613,8 @@ export function StudioStage({
                           animTimeRef.current = 0;
                           setStageMode('player');
                           setIsPlaying(true);
+                          setEffectMode(hasPowers ? 'powers' : hasImpacts ? 'all' : 'base');
+                          openDetachedPlayer();
                         }}
                         className={`flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-left text-xs transition-colors cursor-pointer ${
                           active
@@ -1086,6 +1628,7 @@ export function StudioStage({
                             active ? 'text-orange-100' : 'text-slate-500'
                           }`}
                         >
+                          {hasPowers ? '+poder · ' : hasImpacts ? '+efeito · ' : ''}
                           {dur.toFixed(2)}s
                         </span>
                       </button>
@@ -1095,6 +1638,236 @@ export function StudioStage({
               </div>
             )}
           </aside>
+        </div>
+      )}
+
+      {showCompleteExportModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="complete-char-export-title"
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4"
+        >
+          <div className="w-full max-w-lg rounded-lg border border-slate-700 bg-[#131A26] p-5 space-y-4 max-h-[92vh] overflow-y-auto shadow-2xl">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
+              <div>
+                <h3
+                  id="complete-char-export-title"
+                  className="font-display text-base font-semibold text-slate-50"
+                >
+                  Exportar Personagem Completo (ZIP)
+                </h3>
+                <p className="mt-0.5 font-mono text-xs text-slate-400">
+                  {ninja.id} · {frames.length} frames · {animNames.length} animações ·{' '}
+                  {completeEffectPlan.uniqueSpineIds.length} pacote(s) de partículas
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={Boolean(completeExportProgress)}
+                onClick={() => setShowCompleteExportModal(false)}
+                aria-label="Fechar janela"
+                className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40 cursor-pointer"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            {completeEffectPlan.uniqueSpineIds.length > 0 && (
+              <div className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 space-y-1.5">
+                <div className="text-[11px] font-medium text-slate-300">
+                  Pacotes de partículas vinculados encontrados no <code className="font-mono text-orange-300">.json</code>:
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {completeEffectPlan.uniqueSpineIds.map((effId) => (
+                    <span
+                      key={effId}
+                      className="rounded border border-orange-500/30 bg-orange-950/30 px-2 py-0.5 font-mono text-[11px] text-orange-200"
+                    >
+                      {effId}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2 text-xs">
+              <label className="block space-y-1">
+                <span className="font-medium text-slate-300">Escopo de partículas e poderes</span>
+                <select
+                  disabled={Boolean(completeExportProgress)}
+                  value={completeEffectScope}
+                  onChange={(e) => setCompleteEffectScope(e.target.value as EffectIncludeScope)}
+                  className="w-full rounded-md border border-slate-800 bg-[#0B0F17] px-3 py-2 text-xs text-slate-100"
+                >
+                  <option value="powers">Com poderes (partículas no ninja e tela — recomendado)</option>
+                  <option value="all">Completa (+ efeitos de impacto no alvo)</option>
+                  <option value="base">Somente ninja (sem partículas)</option>
+                </select>
+              </label>
+
+              <div className="space-y-2 pt-1">
+                <span className="block font-medium text-slate-300">O que incluir na pasta do personagem</span>
+
+                <label className="flex items-start gap-2.5 rounded-md border border-slate-800 bg-[#0B0F17] p-2.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={Boolean(completeExportProgress)}
+                    checked={completeIncludeOriginals}
+                    onChange={(e) => setCompleteIncludeOriginals(e.target.checked)}
+                    className="mt-0.5 accent-orange-500"
+                  />
+                  <div>
+                    <div className="font-medium text-slate-100">
+                      Originais + Frames Fatiados
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Inclui <code className="font-mono">.atlas</code>, <code className="font-mono">.json</code>, folha original e pasta <code className="font-mono">frames/*.png</code>.
+                    </div>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-2.5 rounded-md border border-slate-800 bg-[#0B0F17] p-2.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={Boolean(completeExportProgress)}
+                    checked={completeIncludeEffects}
+                    onChange={(e) => setCompleteIncludeEffects(e.target.checked)}
+                    className="mt-0.5 accent-orange-500"
+                  />
+                  <div>
+                    <div className="font-medium text-slate-100">
+                      Pacotes de Partículas + Instruções JSON
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Inclui <code className="font-mono">particulas/&lt;efeito&gt;/</code> e <code className="font-mono">animacoes_instrucoes.json</code> mapeando cada animação e tempo de disparo.
+                    </div>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-2.5 rounded-md border border-slate-800 bg-[#0B0F17] p-2.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={Boolean(completeExportProgress)}
+                    checked={completeIncludeAnimPngs}
+                    onChange={(e) => setCompleteIncludeAnimPngs(e.target.checked)}
+                    className="mt-0.5 accent-orange-500"
+                  />
+                  <div>
+                    <div className="font-medium text-slate-100">
+                      Todas as Animações: Sequência PNG + Spritesheet
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      Renderiza cada animação já composta com as partículas em <code className="font-mono">animacoes/&lt;anim&gt;/</code>.
+                    </div>
+                  </div>
+                </label>
+
+                <div className="rounded-md border border-slate-800 bg-[#0B0F17] p-2.5 space-y-2">
+                  <label className="flex items-start gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      disabled={Boolean(completeExportProgress)}
+                      checked={completeIncludeAnimGifs}
+                      onChange={(e) => setCompleteIncludeAnimGifs(e.target.checked)}
+                      className="mt-0.5 accent-emerald-500"
+                    />
+                    <div>
+                      <div className="font-medium text-slate-100">
+                        Todas as Animações em GIF Animado
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        Gera <code className="font-mono">&lt;anim&gt;.gif</code> já com os poderes para cada animação.
+                      </div>
+                    </div>
+                  </label>
+
+                  {completeIncludeAnimGifs && (
+                    <div className="flex items-center justify-between gap-2 pl-6">
+                      <span className="text-[11px] text-slate-400">Fundo dos GIFs:</span>
+                      <select
+                        disabled={Boolean(completeExportProgress)}
+                        value={completeGifBg}
+                        onChange={(e) =>
+                          setCompleteGifBg(
+                            e.target.value as 'transparent' | 'dark' | 'light' | 'chroma'
+                          )
+                        }
+                        className="rounded border border-slate-800 bg-[#131A26] px-2 py-1 text-[11px] text-slate-200"
+                      >
+                        <option value="transparent">Sem fundo (transparente)</option>
+                        <option value="dark">Fundo escuro</option>
+                        <option value="light">Fundo claro</option>
+                        <option value="chroma">Chroma verde</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {completeExportProgress && (
+              <div className="space-y-1.5 rounded-lg border border-slate-800 bg-[#0B0F17] p-3">
+                <div className="flex items-center justify-between text-xs font-mono tabular-nums">
+                  <span className="truncate text-slate-200">{completeExportProgress.message}</span>
+                  <span className="ml-2 shrink-0 text-emerald-400">
+                    {completeExportProgress.percent}%
+                  </span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                  <div
+                    className="h-full bg-emerald-500 transition-all duration-150"
+                    style={{ width: `${completeExportProgress.percent}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {completeExportError && (
+              <div
+                role="alert"
+                className="rounded-md border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-200"
+              >
+                {completeExportError}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              {completeExportProgress ? (
+                <button
+                  type="button"
+                  onClick={() => completeExportAbortRef.current?.abort()}
+                  className="rounded-lg border border-red-700/70 bg-red-950/40 px-4 py-2 text-xs font-semibold text-red-200 hover:bg-red-900/50 cursor-pointer"
+                >
+                  Cancelar
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setShowCompleteExportModal(false)}
+                    className="rounded-lg border border-slate-700 bg-[#0B0F17] px-4 py-2 text-xs font-medium text-slate-300 hover:border-slate-500 cursor-pointer"
+                  >
+                    Fechar
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      !completeIncludeOriginals &&
+                      !completeIncludeEffects &&
+                      !completeIncludeAnimPngs &&
+                      !completeIncludeAnimGifs
+                    }
+                    onClick={() => void handleRunCompleteCharacterExport()}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 cursor-pointer"
+                  >
+                    <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Baixar {ninja.id}_completo.zip</span>
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </section>

@@ -51,6 +51,27 @@ function runWithConcurrency<T>(task: () => Promise<T>): Promise<T> {
   });
 }
 
+function getSpineKind(ninja: NinjaEntry): 'character' | 'summon_skin' | 'effect' {
+  if (ninja.kind) return ninja.kind;
+  const lower = ninja.id.toLowerCase();
+  if (lower.startsWith('vdfno_')) return 'character';
+  if (
+    lower.endsWith('_effect') ||
+    lower.endsWith('_highteffect') ||
+    lower.endsWith('_ground') ||
+    lower.includes('huomiao')
+  ) {
+    return 'effect';
+  }
+  return 'summon_skin';
+}
+
+const KIND_LABELS: Record<'character' | 'summon_skin' | 'effect', string> = {
+  character: 'Ninja',
+  summon_skin: 'Invocação/Skin',
+  effect: 'Efeito',
+};
+
 async function fetchNinjaThumbnail(ninja: NinjaEntry): Promise<string | null> {
   const cached = thumbnailCache.get(ninja.id);
   if (cached) return cached;
@@ -65,17 +86,34 @@ async function fetchNinjaThumbnail(ninja: NinjaEntry): Promise<string | null> {
       const allRegions = pages.flatMap((p) => p.regions);
       if (allRegions.length === 0) return null;
 
-      // Prefer L0 idle attachment frame if skeleton is available
-      let targetRegionName = allRegions[0].name;
-      const idleSlotAnim = bundle.skeleton?.animations?.idle?.slots;
-      if (idleSlotAnim) {
-        const preferredSlot = idleSlotAnim.L0 || Object.values(idleSlotAnim)[0];
-        const firstAttach = preferredSlot?.attachment?.find((a) => typeof a.name === 'string');
-        if (firstAttach?.name) targetRegionName = firstAttach.name;
+      const largestRegion = allRegions.reduce(
+        (best, r) => (r.width * r.height > best.width * best.height ? r : best),
+        allRegions[0]
+      );
+
+      let targetRegionName = largestRegion.name;
+      const anims = bundle.skeleton?.animations;
+      if (anims) {
+        const animOrder = ['idle', 'stand', 'animation', 'skill', 'attack', ...Object.keys(anims)];
+        for (const animKey of animOrder) {
+          const slots = anims[animKey]?.slots;
+          if (!slots) continue;
+          const slotOrder = [slots.L0, ...Object.values(slots)].filter(Boolean);
+          let matched = false;
+          for (const slotAnim of slotOrder) {
+            const firstAttach = slotAnim?.attachment?.find((a) => typeof a.name === 'string');
+            if (firstAttach?.name && allRegions.some((r) => r.name === firstAttach.name)) {
+              targetRegionName = firstAttach.name;
+              matched = true;
+              break;
+            }
+          }
+          if (matched) break;
+        }
       }
 
       const targetRegion =
-        allRegions.find((r) => r.name === targetRegionName) || allRegions[0];
+        allRegions.find((r) => r.name === targetRegionName) || largestRegion;
       const pageProxyUrl = bundle.pageUrls[targetRegion.pageName] || Object.values(bundle.pageUrls)[0];
       if (!pageProxyUrl) return null;
 
@@ -237,6 +275,8 @@ function NinjaCard({
     };
   }, [ninja, autoThumbnails, directThumbUrl]);
 
+  const kind = getSpineKind(ninja);
+
   return (
     <button
       ref={cardRef}
@@ -276,7 +316,7 @@ function NinjaCard({
 
       <div className="flex flex-col gap-1 p-3">
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate font-mono text-sm font-semibold text-slate-100">
+          <span className="truncate font-mono text-sm font-semibold text-slate-100" title={ninja.id}>
             {ninja.id}
           </span>
           <Eye
@@ -284,12 +324,12 @@ function NinjaCard({
             aria-hidden="true"
           />
         </div>
-        <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono tabular-nums">
+        <div className="flex items-center gap-1.5 text-xs text-slate-400 font-mono tabular-nums truncate">
           <span>
             {ninja.width} × {ninja.height} px
           </span>
           <span aria-hidden="true">·</span>
-          <span>ID {ninja.code}</span>
+          <span>{KIND_LABELS[kind]}</span>
         </div>
       </div>
     </button>
@@ -304,17 +344,33 @@ export function NinjaCatalog({
   onOpenBatchZip,
 }: NinjaCatalogProps) {
   const [search, setSearch] = useState('');
+  const [kindFilter, setKindFilter] = useState<'character' | 'summon_skin' | 'effect' | 'all'>('character');
   const [sortBy, setSortBy] = useState<'id' | 'largest' | 'smallest'>('id');
   const [autoThumbnails, setAutoThumbnails] = useState(true);
   const [page, setPage] = useState(1);
 
+  const counts = useMemo(() => {
+    let character = 0;
+    let summon_skin = 0;
+    let effect = 0;
+    for (const n of ninjas) {
+      const k = getSpineKind(n);
+      if (k === 'character') character++;
+      else if (k === 'summon_skin') summon_skin++;
+      else effect++;
+    }
+    return { all: ninjas.length, character, summon_skin, effect };
+  }, [ninjas]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const list = q
-      ? ninjas.filter(
-          (n) => n.id.toLowerCase().includes(q) || n.code.toLowerCase().includes(q)
-        )
-      : [...ninjas];
+    const list = ninjas.filter((n) => {
+      if (kindFilter !== 'all' && getSpineKind(n) !== kindFilter) return false;
+      if (q && !n.id.toLowerCase().includes(q) && !n.code.toLowerCase().includes(q)) {
+        return false;
+      }
+      return true;
+    });
 
     if (sortBy === 'largest') {
       list.sort((a, b) => b.width * b.height - a.width * a.height);
@@ -324,7 +380,7 @@ export function NinjaCatalog({
       list.sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
     }
     return list;
-  }, [ninjas, search, sortBy]);
+  }, [ninjas, kindFilter, search, sortBy]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -335,16 +391,16 @@ export function NinjaCatalog({
 
   useEffect(() => {
     setPage(1);
-  }, [search, sortBy]);
+  }, [search, sortBy, kindFilter]);
 
   if (ninjas.length === 0) {
     return (
       <div className="mx-auto max-w-2xl rounded-lg border border-slate-800 bg-[#131A26] p-10 text-center">
         <h2 className="font-display text-lg font-semibold text-slate-100">
-          Nenhum sprite de ninja carregado
+          Nenhum pacote Spine carregado
         </h2>
         <p className="mt-2 text-sm text-slate-400">
-          Extraia uma URL de jogo (como https://naruto.jotagame.com/) para indexar o catálogo completo de personagens e sprites Spine.
+          Extraia uma URL de jogo (como https://naruto.jotagame.com/) para indexar personagens, invocações, skins e efeitos Spine.
         </p>
         <button
           type="button"
@@ -359,68 +415,95 @@ export function NinjaCatalog({
 
   return (
     <section className="space-y-5">
-      <div className="flex flex-col gap-4 border-b border-slate-800/80 pb-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h2 className="font-display text-xl font-semibold text-slate-50">
-            Catálogo de Ninjas
-          </h2>
-          <p className="mt-0.5 text-xs text-slate-400 tabular-nums">
-            {filtered.length} de {ninjas.length} pacotes Spine disponíveis · Clique em qualquer ninja para abrir, animar e fatiar
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="relative min-w-[230px] flex-1 sm:flex-initial">
-            <Search
-              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500"
-              aria-hidden="true"
-            />
-            <input
-              type="search"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filtrar por ID (ex: 100301)..."
-              aria-label="Filtrar ninjas por ID"
-              className="w-full rounded-lg border border-slate-800 bg-[#131A26] py-2 pl-9 pr-3 text-sm text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
-            />
+      <div className="flex flex-col gap-4 border-b border-slate-800/80 pb-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <h2 className="font-display text-xl font-semibold text-slate-50">
+              Catálogo Spine (Ninjas, Invocações e Efeitos)
+            </h2>
+            <p className="mt-0.5 text-xs text-slate-400 tabular-nums">
+              {filtered.length} de {ninjas.length} pacotes Spine disponíveis · Clique para abrir no Estúdio, exportar GIF ou fatiar
+            </p>
           </div>
 
-          <select
-            value={sortBy}
-            onChange={(e) => setSortBy(e.target.value as 'id' | 'largest' | 'smallest')}
-            aria-label="Ordenar ninjas"
-            className="rounded-lg border border-slate-800 bg-[#131A26] px-3 py-2 text-sm text-slate-200 focus:border-orange-500 focus:outline-none cursor-pointer"
-          >
-            <option value="id">Ordenar: ID</option>
-            <option value="largest">Ordenar: Maior dimensão</option>
-            <option value="smallest">Ordenar: Menor dimensão</option>
-          </select>
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="relative min-w-[230px] flex-1 sm:flex-initial">
+              <Search
+                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500"
+                aria-hidden="true"
+              />
+              <input
+                type="search"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Buscar ID ou nome (ex: Wanshe, 100301)..."
+                aria-label="Filtrar pacotes Spine por ID ou nome"
+                className="w-full rounded-lg border border-slate-800 bg-[#131A26] py-2 pl-9 pr-3 text-sm text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
+              />
+            </div>
 
-          <label className="inline-flex items-center gap-2 rounded-lg border border-slate-800 bg-[#131A26] px-3 py-2 text-xs font-medium text-slate-300 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={autoThumbnails}
-              onChange={(e) => setAutoThumbnails(e.target.checked)}
-              className="h-3.5 w-3.5 accent-orange-500"
-            />
-            <span className="whitespace-nowrap">Miniaturas automáticas</span>
-          </label>
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as 'id' | 'largest' | 'smallest')}
+              aria-label="Ordenar pacotes"
+              className="rounded-lg border border-slate-800 bg-[#131A26] px-3 py-2 text-sm text-slate-200 focus:border-orange-500 focus:outline-none cursor-pointer"
+            >
+              <option value="id">Ordenar: ID / Nome</option>
+              <option value="largest">Ordenar: Maior dimensão</option>
+              <option value="smallest">Ordenar: Menor dimensão</option>
+            </select>
 
-          <button
-            type="button"
-            disabled={filtered.length === 0}
-            onClick={() => onOpenBatchZip(filtered)}
-            className="inline-flex items-center gap-2 rounded-lg bg-orange-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-orange-500 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
-          >
-            <Download className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>Baixar Todos ({filtered.length}) ZIP</span>
-          </button>
+            <label className="inline-flex items-center gap-2 rounded-lg border border-slate-800 bg-[#131A26] px-3 py-2 text-xs font-medium text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={autoThumbnails}
+                onChange={(e) => setAutoThumbnails(e.target.checked)}
+                className="h-3.5 w-3.5 accent-orange-500"
+              />
+              <span className="whitespace-nowrap">Miniaturas automáticas</span>
+            </label>
+
+            <button
+              type="button"
+              disabled={filtered.length === 0}
+              onClick={() => onOpenBatchZip(filtered)}
+              className="inline-flex items-center gap-2 rounded-lg bg-orange-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-orange-500 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Baixar Todos ({filtered.length}) ZIP</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] p-1 w-fit">
+          {(
+            [
+              { id: 'character', label: 'Ninjas', count: counts.character },
+              { id: 'summon_skin', label: 'Invocações e Skins', count: counts.summon_skin },
+              { id: 'effect', label: 'Efeitos e Auras', count: counts.effect },
+              { id: 'all', label: 'Todos', count: counts.all },
+            ] as const
+          ).map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setKindFilter(tab.id)}
+              aria-pressed={kindFilter === tab.id}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer tabular-nums ${
+                kindFilter === tab.id
+                  ? 'bg-orange-600 text-white'
+                  : 'text-slate-400 hover:text-slate-100'
+              }`}
+            >
+              {tab.label} ({tab.count})
+            </button>
+          ))}
         </div>
       </div>
 
       {pageItems.length === 0 ? (
         <div className="rounded-lg border border-slate-800 bg-[#131A26] p-8 text-center text-sm text-slate-400">
-          Nenhum ninja encontrado para "{search}".
+          Nenhum pacote encontrado para "{search}".
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">

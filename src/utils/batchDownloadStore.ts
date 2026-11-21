@@ -1,6 +1,10 @@
 import { computeCrc32, type StreamingZipEntry } from './streamingZip';
 
-export type BatchContentMode = 'idle-only' | 'all-sliced' | 'raw-bundle';
+export type BatchContentMode =
+  | 'idle-only'
+  | 'all-sliced'
+  | 'raw-bundle'
+  | 'complete-animated';
 export type BatchJobStatus = 'running' | 'paused' | 'completed';
 
 export interface StoredNinjaFileRecord {
@@ -22,6 +26,9 @@ export interface StoredNinjaEntry {
 export interface BatchJobRecord {
   id: string;
   contentMode: BatchContentMode;
+  includeLinkedEffects?: boolean;
+  effectScope?: 'powers' | 'all' | 'base';
+  includeAnimGifs?: boolean;
   startIdx: number;
   endIdx: number;
   chunkSize: number;
@@ -168,6 +175,9 @@ export async function clearAllBatchJobs(): Promise<void> {
 
 export async function createBatchJob(params: {
   contentMode: BatchContentMode;
+  includeLinkedEffects?: boolean;
+  effectScope?: 'powers' | 'all' | 'base';
+  includeAnimGifs?: boolean;
   startIdx: number;
   endIdx: number;
   chunkSize: number;
@@ -179,6 +189,9 @@ export async function createBatchJob(params: {
   const job: BatchJobRecord = {
     id: `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     contentMode: params.contentMode,
+    includeLinkedEffects: params.includeLinkedEffects,
+    effectScope: params.effectScope,
+    includeAnimGifs: params.includeAnimGifs,
     startIdx: params.startIdx,
     endIdx: params.endIdx,
     chunkSize: params.chunkSize,
