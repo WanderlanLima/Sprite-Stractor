@@ -153,7 +153,7 @@ export function LocalSlicer({ externalSource, onFramesChange }: LocalSlicerProps
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[320px_1fr]">
         {/* Controls Panel */}
-        <div className="space-y-4">
+        <div className="min-w-0 space-y-4">
           <div className="rounded-lg border border-slate-800 bg-[#131A26] p-4 space-y-4">
             <div>
               <label className="block text-xs font-medium text-slate-300 mb-2">
@@ -391,7 +391,7 @@ export function LocalSlicer({ externalSource, onFramesChange }: LocalSlicerProps
         </div>
 
         {/* Sliced Frames Grid */}
-        <div className="rounded-lg border border-slate-800 bg-[#131A26] p-4">
+        <div className="min-w-0 rounded-lg border border-slate-800 bg-[#131A26] p-4">
           {frames.length === 0 ? (
             <div className="flex h-80 flex-col items-center justify-center text-center text-sm text-slate-400">
               <Scissors className="h-7 w-7 text-slate-600 mb-2" aria-hidden="true" />

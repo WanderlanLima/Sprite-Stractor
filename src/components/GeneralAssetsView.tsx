@@ -229,7 +229,7 @@ export function GeneralAssetsView({
     <section className="space-y-5">
       <div className="flex flex-col gap-4 border-b border-slate-800/80 pb-4">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex flex-wrap items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] p-1 w-fit">
+          <div className="flex w-full items-center gap-1 overflow-x-auto rounded-lg border border-slate-800 bg-[#131A26] p-1 sm:w-fit">
             <button
               type="button"
               onClick={() => setSubTab('sheets')}
@@ -313,7 +313,7 @@ export function GeneralAssetsView({
               </select>
             )}
 
-            <div className="relative min-w-[220px]">
+            <div className="relative w-full min-w-0 sm:w-auto sm:min-w-[220px]">
               <Search
                 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500"
                 aria-hidden="true"

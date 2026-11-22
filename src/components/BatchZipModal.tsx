@@ -833,9 +833,9 @@ export function BatchZipModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="batch-zip-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-2 sm:p-4"
     >
-      <div className="w-full max-w-lg rounded-lg border border-slate-700 bg-[#131A26] p-6 space-y-5 max-h-[92vh] overflow-y-auto">
+      <div className="w-full max-w-lg rounded-lg border border-slate-700 bg-[#131A26] p-4 sm:p-6 space-y-4 sm:space-y-5 max-h-[90dvh] overflow-y-auto">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h3 id="batch-zip-title" className="font-display text-lg font-semibold text-slate-50">
@@ -1032,14 +1032,14 @@ export function BatchZipModal({
             </label>
 
             {(includeLinkedEffects || contentMode === 'complete-animated') && (
-              <div className="flex flex-wrap items-center justify-between gap-2 pl-5">
+              <div className="flex flex-col items-stretch gap-2 pl-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:pl-5">
                 <span className="text-[11px] text-slate-400">Escopo das partículas:</span>
                 <select
                   disabled={running || packaging}
                   value={effectScope}
                   onChange={(e) => setEffectScope(e.target.value as EffectIncludeScope)}
                   aria-label="Escopo das partículas no lote"
-                  className="rounded border border-slate-800 bg-[#131A26] px-2 py-1 text-[11px] text-slate-200"
+                  className="w-full rounded border border-slate-800 bg-[#131A26] px-2 py-1.5 text-[11px] text-slate-200 sm:w-auto sm:py-1"
                 >
                   <option value="powers">Com poderes (personagem + tela)</option>
                   <option value="all">Completa (+ impactos no alvo)</option>
@@ -1050,17 +1050,17 @@ export function BatchZipModal({
 
             {contentMode === 'complete-animated' && (
               <>
-                <label className="flex items-center gap-2 pl-5 text-slate-200 cursor-pointer">
+                <label className="flex items-start gap-2 pl-2 text-slate-200 cursor-pointer sm:items-center sm:pl-5">
                   <input
                     type="checkbox"
                     disabled={running || packaging}
                     checked={includeAnimGifs}
                     onChange={(e) => setIncludeAnimGifs(e.target.checked)}
-                    className="accent-emerald-500"
+                    className="mt-0.5 accent-emerald-500 sm:mt-0"
                   />
                   <span>Gerar GIF animado para cada animação (além de PNGs e Spritesheet)</span>
                 </label>
-                <p className="pl-5 text-[11px] text-amber-300/90">
+                <p className="pl-2 text-[11px] text-amber-300/90 sm:pl-5">
                   Dica: o modo completo gera muitos arquivos e imagens — recomenda-se dividir o ZIP em 25 ou 50 pacotes.
                 </p>
               </>
@@ -1154,7 +1154,7 @@ export function BatchZipModal({
           </div>
         )}
 
-        <div className="flex items-center justify-end gap-3 pt-1">
+        <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3 pt-1">
           {running ? (
             <button
               type="button"

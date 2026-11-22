@@ -50,7 +50,7 @@ import {
   exportCompleteCharacterZip,
   type EffectIncludeScope,
 } from '../utils/completeCharacterExporter';
-import { fetchNinjaBundle } from '../utils/remoteClient';
+import { fetchNinjaBundle, resolveAssetFetchUrl } from '../utils/remoteClient';
 
 interface LoadedEffectBundle {
   skeleton: SpineSkeleton;
@@ -211,6 +211,7 @@ export function StudioStage({
 
   const [playerDetached, setPlayerDetached] = useState(false);
   const [dockHeight, setDockHeight] = useState(0);
+  const [nameArtFailed, setNameArtFailed] = useState(false);
 
   const playerCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const playerBoxRef = useRef<HTMLDivElement | null>(null);
@@ -244,8 +245,10 @@ export function StudioStage({
     setError(null);
     setSelectedRegion(null);
     setCurrentTime(0);
+    setAutoFit(true);
     setZoom(1);
     setPan({ x: 0, y: 0 });
+    setNameArtFailed(false);
     savedScrollYRef.current = null;
     setDockHeight(0);
     setPlayerDetached(false);
@@ -530,14 +533,6 @@ export function StudioStage({
     );
   }, [skeleton, selectedAnim, regionCanvasMap, compositeLayers]);
 
-  // Reset framing cleanly when switching animations if autoFit is active
-  useEffect(() => {
-    if (autoFit) {
-      setZoom(1);
-      setPan({ x: 0, y: 0 });
-    }
-  }, [selectedAnim, autoFit]);
-
   // Animation loop
   useEffect(() => {
     if (stageMode !== 'player' || !skeleton || !selectedAnim || regionCanvasMap.size === 0) {
@@ -564,7 +559,12 @@ export function StudioStage({
         pan.x,
         pan.y,
         autoFit ? animWorldBounds : null,
-        compositeLayers
+        compositeLayers,
+        {
+          fillRatio: 0.66,
+          maxAutoFitScale: 1.65,
+          followFramePose: zoom > 1.05,
+        }
       );
     };
 
@@ -622,7 +622,12 @@ export function StudioStage({
         pan.x,
         pan.y,
         autoFit ? animWorldBounds : null,
-        compositeLayers
+        compositeLayers,
+        {
+          fillRatio: 0.66,
+          maxAutoFitScale: 1.65,
+          followFramePose: zoom > 1.05,
+        }
       );
     }
   }, [
@@ -852,34 +857,48 @@ export function StudioStage({
   return (
     <section className="space-y-4">
       {/* Studio Sub-header */}
-      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800/80 pb-4">
-        <div className="flex items-center gap-3">
+      <div className="flex flex-col gap-3 border-b border-slate-800/80 pb-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-4">
+        <div className="flex min-w-0 items-center gap-3">
           <button
             type="button"
             onClick={onBackToCatalog}
-            className="inline-flex items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white cursor-pointer"
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-600 hover:text-white cursor-pointer"
           >
             <ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
             <span>Catálogo</span>
           </button>
-          <div>
-            <h2 className="font-display text-lg font-semibold text-slate-50 font-mono">
-              {ninja.id}
-            </h2>
+          {ninja.nameArtUrl && !nameArtFailed && (
+            <img
+              src={resolveAssetFetchUrl(ninja.nameArtUrl)}
+              alt={ninja.name || ninja.id}
+              onError={() => setNameArtFailed(true)}
+              referrerPolicy="no-referrer"
+              className="hidden h-9 w-auto max-w-[140px] shrink-0 object-contain sm:block"
+            />
+          )}
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+              <h2 className="truncate font-display text-base font-semibold text-slate-50 sm:text-lg">
+                {ninja.name || ninja.id}
+              </h2>
+              {ninja.name && (
+                <span className="font-mono text-xs text-slate-400">{ninja.id}</span>
+              )}
+            </div>
             <p className="text-xs text-slate-400 font-mono tabular-nums">
               {ninja.width} × {ninja.height} px · {frames.length} frames · {animNames.length} animações
             </p>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           {/* Mode Switcher */}
-          <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#131A26] p-1">
+          <div className="flex w-full items-center gap-1 overflow-x-auto rounded-lg border border-slate-800 bg-[#131A26] p-1 sm:w-auto">
             <button
               type="button"
               onClick={() => setStageMode('player')}
               disabled={animNames.length === 0}
-              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-40 ${
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 ${
                 stageMode === 'player'
                   ? 'bg-orange-600 text-white'
                   : 'text-slate-400 hover:text-slate-100'
@@ -891,7 +910,7 @@ export function StudioStage({
             <button
               type="button"
               onClick={() => setStageMode('frames')}
-              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 stageMode === 'frames'
                   ? 'bg-orange-600 text-white'
                   : 'text-slate-400 hover:text-slate-100'
@@ -903,7 +922,7 @@ export function StudioStage({
             <button
               type="button"
               onClick={() => setStageMode('sheet')}
-              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 stageMode === 'sheet'
                   ? 'bg-orange-600 text-white'
                   : 'text-slate-400 hover:text-slate-100'
@@ -918,7 +937,7 @@ export function StudioStage({
             type="button"
             disabled={loading || Boolean(error)}
             onClick={() => setShowCompleteExportModal(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 cursor-pointer whitespace-nowrap"
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 cursor-pointer whitespace-nowrap sm:w-auto"
           >
             <Download className="h-3.5 w-3.5" aria-hidden="true" />
             <span>Baixar Completo (ZIP)</span>
@@ -927,11 +946,11 @@ export function StudioStage({
       </div>
 
       {loading && (
-        <div className="flex h-80 items-center justify-center rounded-lg border border-slate-800 bg-[#131A26]">
+        <div className="flex h-80 items-center justify-center rounded-lg border border-slate-800 bg-[#131A26] px-4">
           <div className="text-center">
             <div className="mx-auto h-7 w-7 animate-spin rounded-full border-2 border-slate-700 border-t-orange-500" />
             <p className="mt-3 text-sm text-slate-300">
-              Baixando atlas, skeleton e folha WebP de {ninja.id}...
+              Baixando atlas, skeleton e folha WebP de {ninja.name ? `${ninja.name} (${ninja.id})` : ninja.id}...
             </p>
           </div>
         </div>
@@ -977,7 +996,7 @@ export function StudioStage({
                 <div
                   className={
                     playerDetached
-                      ? 'fixed inset-0 z-50 overflow-y-auto bg-[#0B0F17]/95 backdrop-blur-md p-3 sm:p-6'
+                      ? 'fixed inset-0 z-50 overflow-y-auto bg-[#0B0F17]/95 backdrop-blur-md p-2 sm:p-6 pb-[max(0.75rem,env(safe-area-inset-bottom))]'
                       : ''
                   }
                   onClick={
@@ -991,22 +1010,27 @@ export function StudioStage({
                   }
                   role={playerDetached ? 'dialog' : undefined}
                   aria-modal={playerDetached ? true : undefined}
-                  aria-label={playerDetached ? `Player de animação ${ninja.id}` : undefined}
+                  aria-label={playerDetached ? `Player de animação ${ninja.name || ninja.id}` : undefined}
                 >
                   <div
                     ref={!playerDetached ? playerBoxRef : undefined}
                     className={`rounded-lg border border-slate-800 bg-[#131A26] ${
                       playerDetached
-                        ? 'mx-auto my-2 w-full max-w-6xl border-slate-700/80 shadow-2xl'
+                        ? 'mx-auto my-1 sm:my-2 w-full max-w-6xl border-slate-700/80 shadow-2xl'
                         : 'overflow-hidden'
                     }`}
                   >
                     {playerDetached && (
-                      <div className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-t-lg border-b border-slate-800/80 bg-[#0F1520] px-4 py-2.5">
+                      <div className="sticky top-0 z-10 flex items-center justify-between gap-2 rounded-t-lg border-b border-slate-800/80 bg-[#0F1520] px-3 py-2 sm:px-4 sm:py-2.5">
                         <div className="flex min-w-0 items-center gap-2 text-xs">
-                          <span className="truncate font-mono font-semibold text-slate-100">
-                            {ninja.id}
+                          <span className="truncate font-display font-semibold text-slate-100">
+                            {ninja.name || ninja.id}
                           </span>
+                          {ninja.name && (
+                            <span className="hidden font-mono text-[11px] text-slate-400 sm:inline">
+                              ({ninja.id})
+                            </span>
+                          )}
                           <span className="text-slate-500" aria-hidden="true">
                             ·
                           </span>
@@ -1017,7 +1041,7 @@ export function StudioStage({
                         <button
                           type="button"
                           onClick={closeDetachedPlayer}
-                          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#131A26] px-4 py-2 text-xs font-semibold text-slate-100 hover:border-orange-500 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                          className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#131A26] px-3 py-1.5 text-xs font-semibold text-slate-100 hover:border-orange-500 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 transition-colors whitespace-nowrap shrink-0 cursor-pointer sm:px-4 sm:py-2"
                         >
                           <X className="h-4 w-4" aria-hidden="true" />
                           <span>Fechar</span>
@@ -1026,7 +1050,7 @@ export function StudioStage({
                     )}
 
                     {/* Canvas Toolbar */}
-                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 px-4 py-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 px-2.5 py-2 sm:gap-3 sm:px-4 sm:py-2.5">
                       <div className="flex flex-wrap items-center gap-2">
                         <div className="flex items-center gap-1.5">
                           {(
@@ -1150,12 +1174,11 @@ export function StudioStage({
                           type="button"
                           onClick={() => {
                             setAutoFit(true);
-                            setZoom(1);
                             setPan({ x: 0, y: 0 });
                           }}
-                          title="Enquadrar animação inteira na tela"
+                          title="Centralizar animação mantendo o zoom atual"
                           className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-xs font-medium whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
-                            autoFit && zoom === 1 && pan.x === 0 && pan.y === 0
+                            autoFit && pan.x === 0 && pan.y === 0
                               ? 'border-orange-500/60 bg-orange-950/30 text-orange-200'
                               : 'border-slate-800 bg-[#0B0F17] text-slate-300 hover:border-slate-600'
                           }`}
@@ -1175,9 +1198,18 @@ export function StudioStage({
                           >
                             <ZoomOut className="h-3.5 w-3.5" aria-hidden="true" />
                           </button>
-                          <span className="w-11 text-center font-mono text-xs text-slate-300 tabular-nums">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setZoom(1);
+                              setPan({ x: 0, y: 0 });
+                            }}
+                            title="Clique para voltar o zoom a 100%"
+                            aria-label={`Zoom atual ${Math.round(zoom * 100)}%, clique para resetar para 100%`}
+                            className="w-11 rounded py-1 text-center font-mono text-xs text-slate-300 tabular-nums hover:bg-slate-800 hover:text-white cursor-pointer"
+                          >
                             {Math.round(zoom * 100)}%
-                          </span>
+                          </button>
                           <button
                             type="button"
                             onClick={() =>
@@ -1194,8 +1226,8 @@ export function StudioStage({
 
                     {/* Stage Canvas (supports touch/mouse drag to pan) */}
                     <div
-                      className={`${bgClass} relative flex items-center justify-center p-4 ${
-                        playerDetached ? 'h-[48vh] min-h-[260px] max-h-[520px]' : ''
+                      className={`${bgClass} relative flex items-center justify-center p-2 sm:p-4 ${
+                        playerDetached ? 'h-[40dvh] min-h-[220px] sm:h-[48vh] max-h-[520px]' : ''
                       }`}
                     >
                       <canvas
@@ -1238,12 +1270,14 @@ export function StudioStage({
                         }
                       />
                       <span className="pointer-events-none absolute bottom-2 right-3 rounded bg-black/55 px-2 py-0.5 text-[10px] font-mono text-slate-300">
-                        Arraste para mover · Enquadramento automático ativo
+                        {zoom > 1.05
+                          ? 'Arraste para mover · Rastreamento automático ativo'
+                          : 'Arraste para mover · Enquadramento automático ativo'}
                       </span>
                     </div>
 
                 {/* Playback & Export Controls */}
-                <div className="space-y-3 border-t border-slate-800/80 p-4">
+                <div className="space-y-3 border-t border-slate-800/80 p-3 sm:p-4">
                   <div className="flex flex-wrap items-center gap-3">
                     <button
                       type="button"
@@ -1336,7 +1370,7 @@ export function StudioStage({
                       <Download className="h-3.5 w-3.5" aria-hidden="true" />
                       <span>Exportar Spritesheet ({selectedAnim})</span>
                     </button>
-                    <div className="inline-flex items-center overflow-hidden rounded-lg border border-emerald-500/40 bg-emerald-950/30">
+                    <div className="inline-flex max-w-full flex-wrap items-center overflow-hidden rounded-lg border border-emerald-500/40 bg-emerald-950/30 sm:flex-nowrap">
                       <select
                         value={gifBg}
                         disabled={exportingAnim || gifProgress !== null}
@@ -1346,7 +1380,7 @@ export function StudioStage({
                           )
                         }
                         aria-label="Fundo do GIF"
-                        className="border-r border-emerald-500/30 bg-transparent px-2 py-1.5 text-xs text-emerald-100 focus:outline-none cursor-pointer disabled:opacity-50"
+                        className="border-b border-emerald-500/30 bg-transparent px-2 py-1.5 text-xs text-emerald-100 focus:outline-none cursor-pointer disabled:opacity-50 sm:border-b-0 sm:border-r"
                       >
                         <option value="transparent" className="bg-[#0B0F17] text-slate-100">
                           Sem fundo
@@ -1403,7 +1437,7 @@ export function StudioStage({
                     value={frameFilter}
                     onChange={(e) => setFrameFilter(e.target.value)}
                     placeholder="Filtrar frame (ex: a33, a0)..."
-                    className="w-60 rounded-lg border border-slate-800 bg-[#0B0F17] px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none"
+                    className="w-full rounded-lg border border-slate-800 bg-[#0B0F17] px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:border-orange-500 focus:outline-none sm:w-60"
                   />
                   <div className="flex flex-wrap items-center gap-2">
                     <button
@@ -1592,7 +1626,24 @@ export function StudioStage({
               <h3 className="font-display text-sm font-semibold text-slate-100">
                 Especificações do Ativo
               </h3>
+              {ninja.nameArtUrl && !nameArtFailed && (
+                <div className="flex items-center justify-center rounded-md border border-slate-800/80 bg-[#0B0F17] px-3 py-2">
+                  <img
+                    src={resolveAssetFetchUrl(ninja.nameArtUrl)}
+                    alt={ninja.name || ninja.id}
+                    onError={() => setNameArtFailed(true)}
+                    referrerPolicy="no-referrer"
+                    className="max-h-14 w-auto max-w-full object-contain"
+                  />
+                </div>
+              )}
               <dl className="space-y-2 text-xs">
+                {ninja.name && (
+                  <div className="flex justify-between gap-2 border-b border-slate-800/60 pb-1.5">
+                    <dt className="text-slate-400">Personagem</dt>
+                    <dd className="text-right font-medium text-slate-100">{ninja.name}</dd>
+                  </div>
+                )}
                 <div className="flex justify-between gap-2 border-b border-slate-800/60 pb-1.5">
                   <dt className="text-slate-400">Identificador</dt>
                   <dd className="font-mono text-slate-100">{ninja.id}</dd>
@@ -1650,6 +1701,9 @@ export function StudioStage({
                           setSelectedAnim(anim);
                           setCurrentTime(0);
                           animTimeRef.current = 0;
+                          setAutoFit(true);
+                          setZoom(1);
+                          setPan({ x: 0, y: 0 });
                           setStageMode('player');
                           setIsPlaying(true);
                           setEffectMode(hasPowers ? 'powers' : hasImpacts ? 'all' : 'base');
@@ -1685,11 +1739,11 @@ export function StudioStage({
           role="dialog"
           aria-modal="true"
           aria-labelledby="complete-char-export-title"
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4"
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-2 sm:p-4"
         >
-          <div className="w-full max-w-lg rounded-lg border border-slate-700 bg-[#131A26] p-5 space-y-4 max-h-[92vh] overflow-y-auto shadow-2xl">
+          <div className="w-full max-w-lg rounded-lg border border-slate-700 bg-[#131A26] p-4 sm:p-5 space-y-4 max-h-[90dvh] overflow-y-auto shadow-2xl">
             <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
-              <div>
+              <div className="min-w-0">
                 <h3
                   id="complete-char-export-title"
                   className="font-display text-base font-semibold text-slate-50"
@@ -1697,6 +1751,7 @@ export function StudioStage({
                   Exportar Personagem Completo (ZIP)
                 </h3>
                 <p className="mt-0.5 font-mono text-xs text-slate-400">
+                  {ninja.name ? `${ninja.name} · ` : ''}
                   {ninja.id} · {frames.length} frames · {animNames.length} animações ·{' '}
                   {completeEffectPlan.uniqueSpineIds.length} pacote(s) de partículas
                 </p>
@@ -1822,7 +1877,7 @@ export function StudioStage({
                   </label>
 
                   {completeIncludeAnimGifs && (
-                    <div className="flex items-center justify-between gap-2 pl-6">
+                    <div className="flex flex-wrap items-center justify-between gap-2 pl-2 sm:pl-6">
                       <span className="text-[11px] text-slate-400">Fundo dos GIFs:</span>
                       <select
                         disabled={Boolean(completeExportProgress)}
@@ -1832,7 +1887,7 @@ export function StudioStage({
                             e.target.value as 'transparent' | 'dark' | 'light' | 'chroma'
                           )
                         }
-                        className="rounded border border-slate-800 bg-[#131A26] px-2 py-1 text-[11px] text-slate-200"
+                        className="w-full sm:w-auto rounded border border-slate-800 bg-[#131A26] px-2 py-1 text-[11px] text-slate-200"
                       >
                         <option value="transparent">Sem fundo (transparente)</option>
                         <option value="dark">Fundo escuro</option>
@@ -1871,7 +1926,7 @@ export function StudioStage({
               </div>
             )}
 
-            <div className="flex items-center justify-end gap-2 pt-1">
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
               {completeExportProgress ? (
                 <button
                   type="button"
@@ -1898,7 +1953,7 @@ export function StudioStage({
                       !completeIncludeAnimGifs
                     }
                     onClick={() => void handleRunCompleteCharacterExport()}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 cursor-pointer"
+                    className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 cursor-pointer sm:w-auto"
                   >
                     <Download className="h-3.5 w-3.5" aria-hidden="true" />
                     <span>Baixar {ninja.id}_completo.zip</span>
